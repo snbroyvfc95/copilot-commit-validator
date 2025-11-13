@@ -1,6 +1,6 @@
 {
   "name": "ai-commit-validator",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "An AI-powered commit validator that reviews code using Copilot-like suggestions and requires justification to skip.",
   "main": "index.js",
   "type": "module",
