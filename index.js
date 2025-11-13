@@ -5,8 +5,25 @@ import inquirer from "inquirer";
 import dotenv from "dotenv";
 import fs from "fs/promises";
 import path from "path";
-dotenv.config();
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Load environment variables with fallback
+dotenv.config({ path: '.env.local' }); // Try local first
+dotenv.config(); // Then try .env
+
+// Validate OpenAI API key
+const apiKey = process.env.OPENAI_API_KEY;
+if (!apiKey) {
+  console.error('❌ OPENAI_API_KEY environment variable is required.');
+  console.error('💡 For local development: Add it to .env.local file');
+  console.error('💡 For GitHub Actions: Add it as a repository secret');
+  process.exit(1);
+}
+
+// Initialize OpenAI with configuration from environment
+const openai = new OpenAI({ 
+  apiKey: apiKey,
+  timeout: parseInt(process.env.API_TIMEOUT || '30000')
+});
 const git = simpleGit();
 export async function validateCommit() {
   console.log(chalk.blueBright("🔍 Checking your staged changes..."));
@@ -51,9 +68,10 @@ export async function validateCommit() {
   `;
 
   const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
     messages: [{ role: "user", content: prompt }],
     temperature: 0.3,
+    max_tokens: parseInt(process.env.OPENAI_MAX_TOKENS || "1000"),
   });
 
   const aiFeedback = response.choices[0].message.content;
