@@ -6,7 +6,6 @@ import dotenv from "dotenv";
 import fs from "fs/promises";
 import path from "path";
 import { execSync } from "child_process";
-import dotenv from "dotenv";
 
 // Load environment variables with fallback
 dotenv.config({ path: '.env.local' }); // Try local first
@@ -121,7 +120,8 @@ function filterMeaningfulChanges(diff) {
 
 // Get world-class code review using enhanced Copilot analysis
 async function getCopilotReview(diff) {
-  console.log(chalk.cyan("🤖 Running Enhanced Copilot Analysis for World-Class Code..."));
+  console.log(chalk.cyan("🤖 Running Production-Focused Copilot Analysis..."));
+  console.log(chalk.gray("📋 Context: Make this code for production release"));
   
   const issues = [];
   const suggestions = [];
@@ -216,7 +216,8 @@ async function getCopilotReview(diff) {
     return "✅ WORLD_CLASS_CODE\n🎉 Your code meets world-class standards!\n💡 No improvements needed - excellent work!";
   } else {
     let feedback = "WORLD_CLASS_SUGGESTIONS\n";
-    feedback += "🚀 Copilot recommends these improvements for world-class code:\n\n";
+    feedback += "🚀 Production-Ready Code Improvements:\n";
+    feedback += "📋 Context: Make this code for production release\n\n";
     
     // Group issues by severity
     const criticalIssues = issues.filter(i => i.includes('🔴'));
