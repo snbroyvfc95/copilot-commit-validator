@@ -12,6 +12,9 @@ import dotenv from "dotenv";
 dotenv.config({ path: '.env.local' }); // Try local first
 dotenv.config(); // Then try .env
 
+// Production flag
+const isProd = process.env.NODE_ENV === 'production';
+
 // GitHub token for Copilot access (optional - fallback to local analysis)
 const githubToken = process.env.GITHUB_TOKEN;
 let octokit = null;
@@ -21,10 +24,12 @@ if (githubToken) {
     auth: githubToken,
     timeout: parseInt(process.env.API_TIMEOUT || '30000')
   });
-  console.log(chalk.cyan('🤖 GitHub Copilot integration enabled'));
+  if (!isProd) console.log(chalk.cyan('🤖 GitHub Copilot integration enabled'));
 } else {
-  console.log(chalk.yellow('⚠️  No GITHUB_TOKEN found - using local code analysis'));
-  console.log(chalk.gray('💡 Add GITHUB_TOKEN for enhanced AI features'));
+  if (!isProd) {
+    console.log(chalk.yellow('⚠️  No GITHUB_TOKEN found - using local code analysis'));
+    console.log(chalk.gray('💡 Add GITHUB_TOKEN for enhanced AI features'));
+  }
 }
 
 // Safe prompt wrapper to handle Windows PowerShell input issues
