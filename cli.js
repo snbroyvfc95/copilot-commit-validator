@@ -1,4 +1,10 @@
 #!/usr/bin/env node
-import { validateCommit } from "./index.js";
+import { validateCommit, guidedRecommit } from "./index.js";
 
-validateCommit();
+const args = process.argv.slice(2);
+
+if (args.includes("--recommit")) {
+	guidedRecommit();
+} else {
+	validateCommit();
+}

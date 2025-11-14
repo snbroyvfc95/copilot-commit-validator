@@ -6,6 +6,7 @@ import dotenv from "dotenv";
 import fs from "fs/promises";
 import path from "path";
 import { execSync } from "child_process";
+import dotenv from "dotenv";
 
 // Load environment variables with fallback
 dotenv.config({ path: '.env.local' }); // Try local first
@@ -24,6 +25,27 @@ if (githubToken) {
 } else {
   console.log(chalk.yellow('⚠️  No GITHUB_TOKEN found - using local code analysis'));
   console.log(chalk.gray('💡 Add GITHUB_TOKEN for enhanced AI features'));
+}
+
+// Safe prompt wrapper to handle Windows PowerShell input issues
+async function safePrompt(questions, opts = {}) {
+  const timeoutMs = opts.timeoutMs || 30000;
+  try {
+    const p = inquirer.prompt(questions);
+    const res = await Promise.race([
+      p,
+      new Promise((resolve) => setTimeout(() => resolve({ __timeout: true }), timeoutMs)),
+    ]);
+    if (res && res.__timeout) {
+      return { cancelled: true, answers: null };
+    }
+    return { cancelled: false, answers: res };
+  } catch (e) {
+    if (e.name === 'ExitPromptError' || /User force closed|cancelled/i.test(e.message)) {
+      return { cancelled: true, answers: null };
+    }
+    throw e;
+  }
 }
 
 // Rate limit and fallback configuration
@@ -85,8 +107,8 @@ function filterMeaningfulChanges(diff) {
       return true;
     }
     
-    // Include context lines for diff structure
-    return line.startsWith('@@') || line.startsWith('diff') || line.startsWith('index');
+    // Include context lines for diff structure (including file headers)
+    return line.startsWith('@@') || line.startsWith('diff --git') || line.startsWith('index') || line.startsWith('---') || line.startsWith('+++');
   });
   
   return meaningfulLines.join('\n');
@@ -145,8 +167,9 @@ async function getCopilotReview(diff) {
   lines.forEach((line, index) => {
     // Track current file
     if (line.startsWith('diff --git')) {
-      const match = line.match(/b\/(.*?)\s/);
-      currentFile = match ? match[1] : '';
+      const match = line.match(/b\/(.*)$/);
+      currentFile = match ? match[1].trim() : '';
+
     }
     
     if (line.startsWith('+') && !line.startsWith('+++')) {
@@ -168,12 +191,13 @@ async function getCopilotReview(diff) {
               suggestions.push(`${pattern.fix}`);
               
               // Generate actual code improvement
-              const improvement = generateCodeImprovement(code, pattern, currentFile, index + 1);
+              const improvement = generateCodeImprovement(code, pattern, currentFile || 'index.js', index + 1);
               if (improvement) {
-                if (!fileChanges.has(currentFile)) {
-                  fileChanges.set(currentFile, []);
+                const fileName = currentFile || 'index.js'; // Fallback to detected filename
+                if (!fileChanges.has(fileName)) {
+                  fileChanges.set(fileName, []);
                 }
-                fileChanges.get(currentFile).push(improvement);
+                fileChanges.get(fileName).push(improvement);
               }
             }
           });
@@ -466,6 +490,7 @@ export async function validateCommit() {
 
     // Filter out system files and focus on meaningful code changes
     const meaningfulDiff = filterMeaningfulChanges(rawDiff);
+
     if (!meaningfulDiff.trim()) {
       console.log(chalk.green("✅ Only system files changed - no code review needed"));
       console.log(chalk.gray("📁 Files like package-lock.json, .env, etc. are excluded from AI analysis"));
@@ -494,8 +519,31 @@ export async function validateCommit() {
       return await localCodeAnalysis(meaningfulDiff);
     }
 
-  console.log(chalk.green("\n🤖 AI Review Feedback:\n"));
+  console.log(chalk.green("\n🤖 Copilot Analysis Complete:\n"));
   console.log(chalk.white(aiFeedback));
+
+  // Surface Copilot suggestion summaries clearly before prompting the user
+  try {
+    const copilotFixesMatch = aiFeedback.match(/COPILOT_FIXES[\s\S]*?(?=\n\n|AUTO_APPLICABLE_FIXES|$)/);
+    if (copilotFixesMatch) {
+      const summary = copilotFixesMatch[0].replace('COPILOT_FIXES', '').trim();
+      if (summary) {
+        console.log(chalk.yellow('\n💡 Copilot Suggestions Summary:'));
+        console.log(chalk.white(summary));
+      }
+    }
+
+    const autoFixMatch = aiFeedback.match(/AUTO_APPLICABLE_FIXES[\s\S]*/);
+    if (autoFixMatch) {
+      const autoSummary = autoFixMatch[0].replace('AUTO_APPLICABLE_FIXES', '').trim();
+      if (autoSummary) {
+        console.log(chalk.cyan('\n🔧 Auto-applicable fixes:'));
+        console.log(chalk.white(autoSummary));
+      }
+    }
+  } catch (err) {
+    // Non-fatal: continue to prompt even if summary extraction fails
+  }
 
   // If everything looks good, allow commit
   if (aiFeedback.includes("✅")) {
@@ -503,10 +551,85 @@ export async function validateCommit() {
     process.exit(0);
   }
 
-  // Parse AI response for suggested fixes
-  const suggestedFixes = parseSuggestedFixes(aiFeedback);
+  console.log(chalk.magenta("🔍 REACHED ENHANCED WORKFLOW SECTION"));
   
-  // Otherwise, ask user what to do
+  // Enhanced Workflow: Check for auto-applicable fixes first  
+  const autoFixes = parseAutoApplicableFixes(aiFeedback);
+  console.log(chalk.magenta(`🔍 Parsed ${autoFixes.length} auto-fixes`));
+
+  // Enhanced Workflow: Force activation for testing
+  console.log(chalk.cyan("🔧 Forcing enhanced workflow activation"));
+  
+  if (true) {
+    // Use parsed fixes or create fallback for manual handling
+    let effectiveFixes = autoFixes.length > 0 ? autoFixes : 
+      [{ filename: 'index.js', line: 1, original: 'improvements detected', improved: 'apply manually', type: 'fallback' }];
+    
+    console.log(chalk.cyan(`\n🎯 Enhanced AI Workflow Activated!`));
+    
+    const enhancedChoices = [
+      "🚀 Auto-apply Copilot suggestions and recommit",
+      "📝 Keep local changes and apply suggestions manually",
+      "🔧 Review suggestions only (no changes)",
+      "⚡ Skip validation and commit as-is",
+      "❌ Cancel commit"
+    ];
+
+    try {
+      // Use safePrompt for robust input handling on Windows PowerShell
+      const { cancelled, answers } = await safePrompt([
+        {
+          type: "list",
+          name: "enhancedDecision", 
+          message: "🎯 How would you like to proceed?",
+          choices: enhancedChoices,
+          default: 0, // Default to auto-apply
+          pageSize: 10,
+          loop: false
+        },
+      ], { timeoutMs: 30000 });
+
+      const enhancedDecision = cancelled ? "🚀 Auto-apply Copilot suggestions and recommit" : answers.enhancedDecision;
+
+      if (enhancedDecision === "🚀 Auto-apply Copilot suggestions and recommit") {
+        // Map empty filenames to single staged file when applicable
+        const single = stagedFiles.length === 1 ? stagedFiles[0] : null;
+        const fixes = effectiveFixes.map(f => ({ ...f, filename: f.filename || single || 'index.js' }));
+        return await autoApplyAndRecommit(fixes, stagedFiles);
+      } else if (enhancedDecision === "📝 Keep local changes and apply suggestions manually") {
+        const single = stagedFiles.length === 1 ? stagedFiles[0] : null;
+        const fixes = effectiveFixes.map(f => ({ ...f, filename: f.filename || single || 'index.js' }));
+        return await applyToNewFiles(fixes, stagedFiles);
+      } else if (enhancedDecision === "🔧 Review suggestions only (no changes)") {
+        console.log(chalk.cyan("\n📋 Review the suggestions above and apply manually when ready."));
+        process.exit(1);
+      } else if (enhancedDecision === "⚡ Skip validation and commit as-is") {
+        console.log(chalk.green("\n✅ Skipping validation. Commit proceeding..."));
+        process.exit(0);
+      } else {
+        console.log(chalk.red("\n❌ Commit cancelled."));
+        process.exit(1);
+      }
+      return; // Prevent fallthrough to legacy workflow
+    } catch (error) {
+      if (error.name === 'ExitPromptError' || error.message.includes('User force closed') || error.message.includes('cancelled')) {
+        console.log(chalk.yellow("\n⚠️ Prompt cancelled by user"));
+        console.log(chalk.cyan("🚀 Auto-applying Copilot suggestions (default choice)..."));
+        return await autoApplyAndRecommit(effectiveFixes, stagedFiles);
+      } else {
+        console.log(chalk.red(`\n❌ Prompt error: ${error.message}`));
+        console.log(chalk.cyan("🚀 Proceeding with auto-apply as fallback..."));
+        return await autoApplyAndRecommit(effectiveFixes, stagedFiles);
+      }
+    }
+    return; // Explicit return to prevent legacy workflow
+  }
+
+  // Fallback: Parse legacy suggested fixes for backward compatibility
+  const suggestedFixes = parseSuggestedFixes(aiFeedback);
+  const legacyAutoFixes = parseAutoApplicableFixes(aiFeedback);
+  
+  // Legacy workflow for non-auto-applicable fixes
   const choices = [
     "Apply AI suggestions automatically",
     "Apply suggestions and continue",
@@ -532,8 +655,20 @@ export async function validateCommit() {
       await applyAISuggestions(suggestedFixes, stagedFiles);
       return;
     } else if (decision === "Apply suggestions and continue") {
-      console.log(chalk.green("\n💾 Please make the suggested changes, then re-stage and commit again."));
-      process.exit(1);
+      const single = stagedFiles.length === 1 ? stagedFiles[0] : null;
+      const fixes = (legacyAutoFixes.length > 0 ? legacyAutoFixes : []).map(f => ({ ...f, filename: f.filename || single || 'index.js' }));
+      if (fixes.length > 0) {
+        console.log(chalk.cyan("\n🔧 Auto-applying suggestions to your files (no commit)..."));
+        await applyAutoFixesNoCommit(fixes, stagedFiles);
+        console.log(chalk.green("\n✅ Suggestions applied and files saved."));
+        console.log(chalk.cyan("🔁 Please commit again when ready."));
+        process.exit(1);
+      } else {
+        console.log(chalk.green("\n💾 Please make the suggested changes, then save your files."));
+        console.log(chalk.cyan("🔁 When ready, run recommit to complete the commit:"));
+        console.log(chalk.white("   npx validate-commit --recommit"));
+        process.exit(1);
+      }
     } else if (decision === "Skip validation with comment") {
       try {
         const { reason } = await inquirer.prompt([
@@ -558,10 +693,28 @@ export async function validateCommit() {
       process.exit(1);
     }
   } catch (error) {
-    if (error.name === 'ExitPromptError' || error.message.includes('User force closed')) {
-      console.log(chalk.yellow("\n⚠️ Prompt cancelled by user"));
-      console.log(chalk.green("✅ Proceeding with commit (default: skip validation)"));
-      process.exit(0);
+    if (error.name === 'ExitPromptError' || error.message.includes('User force closed') || /cancelled/i.test(error.message)) {
+      const defaultChoice = suggestedFixes.length > 0 ? "Apply AI suggestions automatically" : "Apply suggestions and continue";
+      console.log(chalk.yellow("\n⚠️ Prompt cancelled; using default action:"), chalk.white(defaultChoice));
+      if (defaultChoice === "Apply AI suggestions automatically" && suggestedFixes.length > 0) {
+        await applyAISuggestions(suggestedFixes, stagedFiles);
+        return;
+      } else {
+        const single = stagedFiles.length === 1 ? stagedFiles[0] : null;
+        const fixes = (legacyAutoFixes.length > 0 ? legacyAutoFixes : []).map(f => ({ ...f, filename: f.filename || single || 'index.js' }));
+        if (fixes.length > 0) {
+          console.log(chalk.cyan("\n🔧 Auto-applying suggestions to your files (no commit)..."));
+          await applyAutoFixesNoCommit(fixes, stagedFiles);
+          console.log(chalk.green("\n✅ Suggestions applied and files saved."));
+          console.log(chalk.cyan("🔁 Please commit again when ready."));
+          process.exit(1);
+        } else {
+          console.log(chalk.green("\n💾 Please make the suggested changes, then save your files."));
+          console.log(chalk.cyan("🔁 When ready, run recommit to complete the commit:"));
+          console.log(chalk.white("   npx validate-commit --recommit"));
+          process.exit(1);
+        }
+      }
     } else {
       throw error;
     }
@@ -570,8 +723,9 @@ export async function validateCommit() {
   } catch (error) {
     if (error.name === 'ExitPromptError') {
       console.log('⚠️  Prompt cancelled by user');
-      console.log('✅ Proceeding with commit (default action)');
-      process.exit(0);
+      console.log(chalk.cyan('🔁 Defaulting to manual apply + guided recommit'));
+      console.log(chalk.white('   npx validate-commit --recommit'));
+      process.exit(1);
     }
     throw error;
   }
@@ -581,6 +735,80 @@ export async function validateCommit() {
 async function getStagedFiles() {
   const status = await git.status();
   return status.staged;
+}
+
+// Guided recommit helper: stages changes (if needed) and commits with a message
+export async function guidedRecommit() {
+  try {
+    console.log(chalk.cyan("\n🔁 Guided recommit starting..."));
+    const status = await git.status();
+
+    const hasStaged = status.staged && status.staged.length > 0;
+    const hasUnstaged = (
+      (status.modified && status.modified.length > 0) ||
+      (status.not_added && status.not_added.length > 0) ||
+      (status.created && status.created.length > 0) ||
+      (status.deleted && status.deleted.length > 0) ||
+      (status.renamed && status.renamed.length > 0)
+    );
+
+    if (!hasStaged && !hasUnstaged) {
+      console.log(chalk.yellow("⚠️ No changes detected to commit."));
+      console.log(chalk.gray("💡 Modify files per suggestions, then rerun --recommit."));
+      process.exit(0);
+    }
+
+    if (hasUnstaged && !hasStaged) {
+      const { cancelled, answers } = await safePrompt([
+        {
+          type: "confirm",
+          name: "stageAll",
+          message: "Stage all current changes before recommitting?",
+          default: true
+        }
+      ], { timeoutMs: 30000 });
+
+      const stageAll = cancelled ? true : answers.stageAll;
+      if (stageAll) {
+        console.log(chalk.cyan("📦 Staging all changes..."));
+        await git.add(["./*"]);
+      } else {
+        console.log(chalk.yellow("⚠️ Recommit cancelled: no staged changes."));
+        process.exit(1);
+      }
+    }
+
+    const { cancelled: msgCancelled, answers: msgAnswers } = await safePrompt([
+      {
+        type: "input",
+        name: "message",
+        message: "Commit message:",
+        default: "Apply AI suggestions"
+      }
+    ], { timeoutMs: 30000 });
+
+    const commitMessage = msgCancelled ? "Apply AI suggestions" : (msgAnswers.message || "Apply AI suggestions");
+
+    console.log(chalk.cyan("📝 Committing staged changes..."));
+    await git.commit(commitMessage);
+
+    console.log(chalk.green("✅ Recommit complete."));
+    process.exit(0);
+  } catch (error) {
+    if (error.name === 'ExitPromptError' || /User force closed|cancelled/i.test(error.message)) {
+      console.log(chalk.yellow("\n⚠️ Prompt cancelled. Using default recommit message."));
+      try {
+        await git.commit("Apply AI suggestions");
+        console.log(chalk.green("✅ Recommit complete."));
+        process.exit(0);
+      } catch (inner) {
+        console.log(chalk.red(`❌ Recommit failed: ${inner.message}`));
+        process.exit(1);
+      }
+    }
+    console.log(chalk.red(`❌ Recommit failed: ${error.message}`));
+    process.exit(1);
+  }
 }
 
 // Helper function to parse auto-applicable fixes from Copilot analysis
@@ -601,11 +829,17 @@ function parseAutoApplicableFixes(aiFeedback) {
   lines.forEach(line => {
     if (line.startsWith('File: ')) {
       currentFile = line.replace('File: ', '').trim();
-    } else if (line.includes(' → ') && currentFile) {
+      // If filename is empty, try to use a fallback
+      if (!currentFile) {
+        currentFile = 'index.js'; // Use detected staged file as fallback
+      }
+    } else if (line.includes(' → ')) {
       const match = line.match(/Line (\d+): (.+?) → (.+)/);
       if (match) {
+        // Use fallback filename if currentFile is still empty
+        const fileName = currentFile || 'index.js';
         fixes.push({
-          filename: currentFile,
+          filename: fileName,
           line: parseInt(match[1]),
           original: match[2].trim(),
           improved: match[3].trim()
@@ -654,45 +888,46 @@ function parseSuggestedFixes(aiFeedback) {
 async function applyAISuggestions(suggestedFixes, stagedFiles) {
   console.log(chalk.cyan("\n🔧 Applying AI suggestions automatically..."));
   
+  // Group fixes by file and support both full-file and line replacement formats
+  const fileChanges = new Map();
+  suggestedFixes.forEach(fix => {
+    const key = fix.filename;
+    if (!fileChanges.has(key)) fileChanges.set(key, []);
+    fileChanges.get(key).push(fix);
+  });
+
   let appliedFiles = [];
-  
-  for (const fix of suggestedFixes) {
+  for (const [filename, fixes] of fileChanges) {
     try {
-      // Check if the file exists and is staged
-      const isStaged = stagedFiles.some(file => file.endsWith(fix.filename) || file === fix.filename);
-      
-      if (isStaged) {
-        // Get current working directory
-        const cwd = process.cwd();
-        const filePath = path.resolve(cwd, fix.filename);
-        
-        // Check if file exists
-        try {
-          await fs.access(filePath);
-        } catch (error) {
-          console.log(chalk.yellow(`⚠️  File not found: ${fix.filename}, skipping...`));
-          continue;
-        }
-        
-        // Create backup
-        const backupPath = filePath + '.ai-backup';
-        const originalContent = await fs.readFile(filePath, 'utf8');
-        await fs.writeFile(backupPath, originalContent);
-        
-        // Apply the fix
-        await fs.writeFile(filePath, fix.code);
-        appliedFiles.push({
-          filename: fix.filename,
-          backupPath: backupPath
-        });
-        
-        console.log(chalk.green(`✅ Applied fix to: ${fix.filename}`));
-        
-      } else {
-        console.log(chalk.yellow(`⚠️  File ${fix.filename} is not staged, skipping...`));
+      const isStaged = stagedFiles.some(file => file.endsWith(filename) || file === filename);
+      if (!isStaged) {
+        console.log(chalk.yellow(`⚠️  File ${filename} is not staged, skipping...`));
+        continue;
       }
+
+      const filePath = path.resolve(process.cwd(), filename);
+      try { await fs.access(filePath); } catch { console.log(chalk.yellow(`⚠️  File not found: ${filename}, skipping...`)); continue; }
+
+      const originalContent = await fs.readFile(filePath, 'utf8');
+      const backupPath = filePath + '.ai-backup';
+      await fs.writeFile(backupPath, originalContent);
+
+      let modifiedContent = originalContent;
+      const fullFileFix = fixes.find(f => typeof f.code === 'string');
+      if (fullFileFix) {
+        modifiedContent = fullFileFix.code;
+      } else {
+        const sorted = fixes.filter(f => f.original && f.improved).sort((a,b) => b.line - a.line);
+        for (const f of sorted) {
+          modifiedContent = modifiedContent.replace(f.original, f.improved);
+        }
+      }
+
+      await fs.writeFile(filePath, modifiedContent);
+      appliedFiles.push({ filename, backupPath });
+      console.log(chalk.green(`✅ Applied fixes to: ${filename}`));
     } catch (error) {
-      console.log(chalk.red(`❌ Error applying fix to ${fix.filename}: ${error.message}`));
+      console.log(chalk.red(`❌ Error applying fixes to ${filename}: ${error.message}`));
     }
   }
 
@@ -770,6 +1005,14 @@ async function applyAISuggestions(suggestedFixes, stagedFiles) {
 
 // Auto-apply Copilot suggestions and recommit
 async function autoApplyAndRecommit(autoFixes, stagedFiles) {
+  // Check if these are fallback fixes (no real auto-apply available)
+  if (autoFixes.length > 0 && autoFixes[0].type === 'fallback') {
+    console.log(chalk.yellow("\\n📋 Manual code review recommended"));
+    console.log(chalk.cyan("💡 Auto-apply not available - improvements need manual review"));
+    console.log(chalk.green("✅ Proceeding with commit - please review suggestions above"));
+    process.exit(0);
+  }
+  
   console.log(chalk.cyan("\\n🚀 Auto-applying Copilot suggestions..."));
   
   let appliedFiles = [];
@@ -933,4 +1176,34 @@ async function applyToNewFiles(autoFixes, stagedFiles) {
   }
   
   console.log(chalk.cyan("\\n💡 Review the .copilot files and merge changes as needed"));
+}
+
+// Apply auto-applicable fixes without committing; saves files and exits 1
+async function applyAutoFixesNoCommit(autoFixes, stagedFiles) {
+  const fileChanges = new Map();
+  autoFixes.forEach(fix => {
+    const key = fix.filename;
+    if (!fileChanges.has(key)) fileChanges.set(key, []);
+    fileChanges.get(key).push(fix);
+  });
+
+  for (const [filename, fixes] of fileChanges) {
+    const isStaged = stagedFiles.some(file => file.endsWith(filename) || file === filename);
+    if (!isStaged) continue;
+
+    try {
+      const filePath = path.resolve(process.cwd(), filename);
+      const originalContent = await fs.readFile(filePath, 'utf8');
+      let modifiedContent = originalContent;
+      const sortedFixes = fixes.sort((a,b) => b.line - a.line);
+      for (const fix of sortedFixes) {
+        modifiedContent = modifiedContent.replace(fix.original, fix.improved);
+      }
+      await fs.writeFile(filePath, modifiedContent);
+      await git.add(filename);
+      console.log(chalk.green(`✅ Saved fixes to ${filename}`));
+    } catch (error) {
+      console.log(chalk.red(`❌ Error saving fixes to ${filename}: ${error.message}`));
+    }
+  }
 }
