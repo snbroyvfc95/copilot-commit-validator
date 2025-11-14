@@ -151,12 +151,26 @@ async function getCopilotReview(diff) {
       { regex: /Promise\.resolve\(\)\.then/i, message: "Promise chaining", severity: "low", fix: "Consider async/await for better readability" },
       { regex: /\.indexOf\(.*\)\s*[><!]==?\s*-?1/i, message: "Legacy indexOf usage", severity: "low", fix: "Use .includes() for better readability" }
     ],
+    naming: [
+      { regex: /\b([a-z])\w*_([a-z])/i, message: "snake_case variable naming", severity: "medium", fix: "Use camelCase for JavaScript variables (e.g., userName instead of user_name)" },
+      { regex: /const\s+([a-z]{1}[a-z0-9]*)\s*=/i, message: "Non-descriptive variable name", severity: "low", fix: "Use descriptive variable names that explain purpose (e.g., userData, isLoading)" },
+      { regex: /function\s+([a-z])/i, message: "Lowercase function name", severity: "medium", fix: "Use PascalCase for constructors/classes or camelCase for functions" },
+      { regex: /const\s+[A-Z]{2,}\s*(?!=)/i, message: "All-caps non-constant variable", severity: "low", fix: "Reserve CONSTANT_CASE for true constants only" },
+      { regex: /\b(cb|fn|tmp|obj|arr|str|num|bool|val|ret|err)\b/i, message: "Single/abbreviated variable name", severity: "low", fix: "Use full descriptive names (callback, error, result, data)" }
+    ],
     codeQuality: [
       { regex: /\/\*\s*TODO/i, message: "TODO comment found", severity: "low", fix: "Create proper issue or implement the TODO" },
       { regex: /\/\*\s*FIXME/i, message: "FIXME comment found", severity: "medium", fix: "Address the FIXME or create an issue" },
       { regex: /\/\*\s*HACK/i, message: "HACK comment found", severity: "medium", fix: "Refactor to remove the hack" },
       { regex: /^\s*\/\/\s*eslint-disable/i, message: "ESLint rule disabled", severity: "medium", fix: "Fix the underlying issue instead of disabling rules" },
       { regex: /catch\s*\(\s*\w+\s*\)\s*\{\s*\}/i, message: "Empty catch block", severity: "high", fix: "Add proper error handling or logging" }
+    ],
+    codeStandards: [
+      { regex: /require\s*\(/i, message: "CommonJS require syntax", severity: "low", fix: "Use ES6 import syntax for consistency and better tree-shaking" },
+      { regex: /\.then\s*\(\s*function/i, message: "Promise with function declaration", severity: "low", fix: "Use arrow functions in promise chains for lexical this binding" },
+      { regex: /if\s*\([a-zA-Z_$][a-zA-Z0-9_$]*\s*==\s*true\)/i, message: "Explicit boolean comparison", severity: "low", fix: "Use implicit boolean check: if (condition) instead of if (condition == true)" },
+      { regex: /if\s*\([a-zA-Z_$][a-zA-Z0-9_$]*\s*==\s*false\)/i, message: "Explicit false comparison", severity: "low", fix: "Use negation: if (!condition) instead of if (condition == false)" },
+      { regex: /try\s*\{[\s\S]{0,100}\}\s*catch\s*\([\w\s]*\)\s*\{\s*\}/i, message: "Try-catch without proper error handling", severity: "medium", fix: "Log errors, throw, or handle gracefully - don't silently ignore" }
     ],
     architecture: [
       { regex: /class\s+\w+\s*\{[\s\S]*constructor[\s\S]*\}[\s\S]*\}/i, message: "Large class detected", severity: "medium", fix: "Consider breaking into smaller, focused classes" },
@@ -244,10 +258,15 @@ async function getCopilotReview(diff) {
     }
     
     if (lowIssues.length > 0) {
-      feedback += "🟢 NICE TO HAVE:\n";
+      feedback += "🟢 NICE TO HAVE (Modern Standards):\n";
       lowIssues.forEach(issue => feedback += `   ${issue}\n`);
       feedback += "\n";
     }
+    
+    // Add section headers for organized feedback
+    feedback += "📚 ANALYSIS CATEGORIES:\n";
+    feedback += "🔐 Security | ⚡ Performance | 🎯 Naming Conventions\n";
+    feedback += "📏 Code Standards | ♻️ Code Quality | 🏗️ Architecture\n\n";
     
     feedback += "COPILOT_FIXES\n";
     [...new Set(suggestions)].forEach((suggestion, i) => {
@@ -287,6 +306,18 @@ function generateCodeImprovement(originalLine, pattern, file, lineNumber) {
     improvedCode = code.replace(/==\s*null/g, '=== null').replace(/!=\s*null/g, '!== null');
   } else if (pattern.message.includes('Console.log')) {
     improvedCode = code.replace(/console\.log\(/g, '// console.log('); // Comment out
+  } else if (pattern.message.includes('snake_case')) {
+    // Convert snake_case to camelCase
+    improvedCode = code.replace(/([a-z]+)_([a-z])/gi, (match, p1, p2) => p1 + p2.toUpperCase());
+  } else if (pattern.message.includes('CommonJS require')) {
+    const match = code.match(/const\s+(\w+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/);
+    if (match) {
+      improvedCode = `import ${match[1]} from "${match[2]}"`;
+    }
+  } else if (pattern.message.includes('Explicit boolean comparison')) {
+    improvedCode = code.replace(/if\s*\(\s*(\w+)\s*==\s*true\s*\)/gi, 'if ($1)');
+  } else if (pattern.message.includes('Explicit false comparison')) {
+    improvedCode = code.replace(/if\s*\(\s*(\w+)\s*==\s*false\s*\)/gi, 'if (!$1)');
   }
   
   if (improvedCode !== code) {

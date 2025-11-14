@@ -1,6 +1,6 @@
 {
   "name": "ai-commit-validator",
-  "version": "2.1.6",
+  "version": "2.1.7",
   "description": "A GitHub Copilot-powered commit validator with intelligent local code analysis and enhanced security pattern detection.",
   "main": "index.js",
   "type": "module",
