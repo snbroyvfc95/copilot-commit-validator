@@ -566,6 +566,15 @@ export async function validateCommit() {
       throw error;
     }
   }
+  
+  } catch (error) {
+    if (error.name === 'ExitPromptError') {
+      console.log('⚠️  Prompt cancelled by user');
+      console.log('✅ Proceeding with commit (default action)');
+      process.exit(0);
+    }
+    throw error;
+  }
 }
 
 // Helper function to get staged files
