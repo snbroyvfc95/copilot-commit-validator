@@ -56,6 +56,9 @@ async function safePrompt(questions, opts = {}) {
 const ENABLE_AI_FALLBACK = process.env.ENABLE_AI_FALLBACK !== 'false';
 const SKIP_ON_RATE_LIMIT = process.env.SKIP_ON_RATE_LIMIT === 'true';
 const git = simpleGit();
+// Default action when an interactive prompt times out or is cancelled.
+// Supported values: 'cancel' | 'auto-apply' | 'skip'
+const DEFAULT_ON_CANCEL = (process.env.AI_DEFAULT_ON_CANCEL || 'cancel').toLowerCase();
 
 // Files to exclude from AI analysis (system/config files)
 const EXCLUDED_FILES = [
@@ -626,7 +629,19 @@ export async function validateCommit() {
         },
       ], { timeoutMs: 30000 });
 
-      const enhancedDecision = cancelled ? "🚀 Auto-apply Copilot suggestions and recommit" : answers.enhancedDecision;
+      // Determine behavior when the prompt times out or is cancelled.
+      let enhancedDecision;
+      if (cancelled) {
+        if (DEFAULT_ON_CANCEL === 'auto-apply') {
+          enhancedDecision = "🚀 Auto-apply Copilot suggestions and recommit";
+        } else if (DEFAULT_ON_CANCEL === 'skip') {
+          enhancedDecision = "⚡ Skip validation and commit as-is";
+        } else {
+          enhancedDecision = "❌ Cancel commit"; // safest default
+        }
+      } else {
+        enhancedDecision = answers.enhancedDecision;
+      }
 
       if (enhancedDecision === "🚀 Auto-apply Copilot suggestions and recommit") {
         // Map empty filenames to single staged file when applicable
@@ -649,14 +664,24 @@ export async function validateCommit() {
       }
       return; // Prevent fallthrough to legacy workflow
     } catch (error) {
+      // Decide fallback behavior when prompt errors or is cancelled
       if (error.name === 'ExitPromptError' || error.message.includes('User force closed') || error.message.includes('cancelled')) {
         console.log(chalk.yellow("\n⚠️ Prompt cancelled by user"));
-        console.log(chalk.cyan("🚀 Auto-applying Copilot suggestions (default choice)..."));
-        return await autoApplyAndRecommit(effectiveFixes, stagedFiles);
+        if (DEFAULT_ON_CANCEL === 'auto-apply') {
+          console.log(chalk.cyan("🚀 Auto-applying Copilot suggestions (configured default)..."));
+          return await autoApplyAndRecommit(effectiveFixes, stagedFiles);
+        } else if (DEFAULT_ON_CANCEL === 'skip') {
+          console.log(chalk.cyan("⚡ Skipping AI validation and proceeding with commit (configured default)"));
+          process.exit(0);
+        } else {
+          console.log(chalk.red("❌ Commit cancelled due to prompt timeout (configured default)."));
+          process.exit(1);
+        }
       } else {
         console.log(chalk.red(`\n❌ Prompt error: ${error.message}`));
-        console.log(chalk.cyan("🚀 Proceeding with auto-apply as fallback..."));
-        return await autoApplyAndRecommit(effectiveFixes, stagedFiles);
+        // As a final fallback, cancel to avoid unintended changes
+        console.log(chalk.red("❌ Commit cancelled due to prompt error."));
+        process.exit(1);
       }
     }
     return; // Explicit return to prevent legacy workflow
