@@ -40,19 +40,14 @@ async function safePrompt(questions, opts = {}) {
   // Allow forcing prompts even when stdin isn't a TTY (use with caution).
   const forcePrompt = (process.env.AI_FORCE_PROMPT || 'false').toLowerCase() === 'true';
 
-  // If stdin is not a TTY (non-interactive environment) we normally skip
-  // interactive prompts because they won't accept input. However, if the
-  // caller explicitly sets AI_FORCE_PROMPT=true we will attempt a fallback
-  // interactive prompt using inquirer's prompt module (may or may not work
-  // depending on the environment). Use with caution.
+  // If stdin is not a TTY (non-interactive environment) we usually cannot
+  // prompt. Instead of immediately giving up, attempt to open the platform
+  // TTY device later so prompts can still work when Git runs hooks from a
+  // non-TTY stdin. Log a concise warning to guide users about the
+  // `AI_FORCE_PROMPT` option if opening the TTY device fails.
   if (!process.stdin || !process.stdin.isTTY) {
-    if (!forcePrompt) {
-      if (!isProd) console.log(chalk.yellow('⚠️  Non-interactive terminal detected - skipping interactive prompts (set AI_FORCE_PROMPT=true to attempt fallback)'));
-      return { cancelled: true, answers: null, nonInteractive: true };
-    } else {
-      if (!isProd) console.log(chalk.yellow('⚠️  Non-interactive terminal detected but AI_FORCE_PROMPT=true — attempting fallback interactive prompt'));
-      // fall through to try prompting with a created prompt module
-    }
+    if (!isProd) console.log(chalk.yellow('⚠️  Non-interactive terminal detected - will attempt terminal-device fallback for prompts (set AI_FORCE_PROMPT=true to force)'));
+    // continue: the TTY device fallback is attempted below
   }
 
   try {
