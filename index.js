@@ -6,7 +6,8 @@ import dotenv from "dotenv";
 import fs from "fs/promises";
 import fsSync from 'fs';
 import path from "path";
-import { execSync } from "child_process";
+import readline from 'readline';
+import { execSync, spawn } from "child_process";
 
 // Load environment variables with fallback
 dotenv.config({ path: '.env.local' }); // Try local first
@@ -32,6 +33,132 @@ if (githubToken) {
   }
 }
 
+// Open files at specific line with editor (VS Code, Sublime, etc)
+async function openFileAtLine(filePath, lineNumber, suggestion) {
+  try {
+    const absolutePath = path.resolve(process.cwd(), filePath);
+    const fileExists = fsSync.existsSync(absolutePath);
+    
+    if (!fileExists) {
+      console.log(chalk.yellow(`⚠️  File not found: ${filePath}`));
+      return false;
+    }
+
+    // Check for VS Code
+    const vscodeCmd = process.platform === 'win32' ? 'code' : 'code';
+    const editorArg = `${absolutePath}:${lineNumber}`;
+
+    try {
+      execSync(`${vscodeCmd} --version`, { stdio: 'ignore' });
+      if (!isProd) console.log(chalk.blue(`📂 Opening ${filePath}:${lineNumber} in VS Code...`));
+      execSync(`${vscodeCmd} "${absolutePath}:${lineNumber}"`, { stdio: 'inherit' });
+      return true;
+    } catch (e) {
+      // VS Code not available, try other editors
+    }
+
+    // Check for Sublime Text
+    try {
+      const sublimeCmd = process.platform === 'win32' ? 'subl' : 'subl';
+      execSync(`${sublimeCmd} --version`, { stdio: 'ignore' });
+      if (!isProd) console.log(chalk.blue(`📂 Opening ${filePath}:${lineNumber} in Sublime Text...`));
+      execSync(`${sublimeCmd} "${absolutePath}:${lineNumber}"`, { stdio: 'inherit' });
+      return true;
+    } catch (e) {
+      // Sublime not available
+    }
+
+    // Check for vim/nano as fallback
+    if (process.platform !== 'win32') {
+      try {
+        execSync('which vim', { stdio: 'ignore' });
+        if (!isProd) console.log(chalk.blue(`📂 Opening ${filePath}:${lineNumber} in Vim...`));
+        // Use vim with line number
+        const vim = spawn('vim', [`+${lineNumber}`, absolutePath], { 
+          stdio: 'inherit',
+          shell: true 
+        });
+        return new Promise((resolve) => {
+          vim.on('close', (code) => resolve(code === 0));
+        });
+      } catch (e) {
+        // vim not available
+      }
+    }
+
+    console.log(chalk.yellow(`⚠️  No supported editor found. Please open: ${absolutePath}:${lineNumber}`));
+    console.log(chalk.cyan(`💡 Suggestion: ${suggestion}`));
+    return false;
+
+  } catch (error) {
+    console.log(chalk.yellow(`⚠️  Error opening file: ${error.message}`));
+    return false;
+  }
+}
+
+// Extract file:line errors from analysis and open them
+async function openErrorLocations(aiFeedback, stagedFiles) {
+  const enableAutoOpen = (process.env.AI_AUTO_OPEN_ERRORS || 'false').toLowerCase() === 'true';
+  
+  if (!enableAutoOpen) {
+    if (!isProd) console.log(chalk.gray('💡 Set AI_AUTO_OPEN_ERRORS=true to automatically open error locations'));
+    return;
+  }
+
+  try {
+    // Extract file:line:column and suggestions from feedback
+    // Pattern: filename.js:line - description
+    const errorPattern = /([a-zA-Z0-9_.\/-]+\.(?:js|ts|jsx|tsx|py|java|rb|go|rs)):(\d+)\s*-\s*(.+?)(?=\n|$)/g;
+    
+    let match;
+    const errors = [];
+    while ((match = errorPattern.exec(aiFeedback)) !== null) {
+      errors.push({
+        file: match[1],
+        line: parseInt(match[2]),
+        suggestion: match[3].trim()
+      });
+    }
+
+    if (errors.length === 0) {
+      return;
+    }
+
+    console.log(chalk.cyan(`\n📂 Opening ${errors.length} error location(s)...`));
+    
+    // Open first error automatically, ask about others
+    if (errors.length > 0) {
+      await openFileAtLine(errors[0].file, errors[0].line, errors[0].suggestion);
+      
+      // For additional errors, offer to open them
+      if (errors.length > 1) {
+        console.log(chalk.yellow(`\n⚠️  Found ${errors.length - 1} more error(s):`));
+        errors.slice(1).forEach((err, i) => {
+          console.log(chalk.gray(`  ${i + 2}. ${err.file}:${err.line} - ${err.suggestion}`));
+        });
+        
+        // Offer to open additional errors
+        const { openMore } = await safePrompt([
+          {
+            type: 'confirm',
+            name: 'openMore',
+            message: 'Open additional error locations?',
+            default: false
+          }
+        ], { timeoutMs: 10000 });
+
+        if (openMore) {
+          for (let i = 1; i < errors.length; i++) {
+            await openFileAtLine(errors[i].file, errors[i].line, errors[i].suggestion);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    if (!isProd) console.log(chalk.yellow(`⚠️  Error processing error locations: ${error.message}`));
+  }
+}
+
 // Safe prompt wrapper to handle Windows PowerShell input issues
 async function safePrompt(questions, opts = {}) {
   // Configurable timeout (ms). If set to 0, disable timeout (wait indefinitely).
@@ -51,35 +178,134 @@ async function safePrompt(questions, opts = {}) {
   }
 
   try {
+      // If AI_AUTO_SELECT is set, simulate a user selection to support
+      // non-interactive test environments (value is 1-based index or literal)
+      const autoSelect = process.env.AI_AUTO_SELECT;
+      if (autoSelect) {
+        const q = Array.isArray(questions) ? questions[0] : questions;
+        if (q) {
+          if (q.type === 'list' && Array.isArray(q.choices) && q.choices.length > 0) {
+            const idx = Math.max(0, Math.min(q.choices.length - 1, (parseInt(autoSelect, 10) || 1) - 1));
+            return { cancelled: false, answers: { [q.name]: q.choices[idx] } };
+          } else if (q.type === 'confirm') {
+            const truthy = ['1','true','yes','y'].includes((autoSelect + '').toLowerCase());
+            return { cancelled: false, answers: { [q.name]: !!truthy } };
+          } else {
+            // Treat as literal input for input prompts
+            return { cancelled: false, answers: { [q.name]: autoSelect } };
+          }
+        }
+      }
       // Use an inquirer prompt module and, when stdin/stdout are not TTY,
       // try opening the platform TTY device so prompts still work in hooks.
       let inputStream = process.stdin;
       let outputStream = process.stdout;
 
       const needsTtyFallback = !process.stdin || !process.stdin.isTTY || !process.stdout || !process.stdout.isTTY;
-      if (needsTtyFallback) {
-        // Platform-specific TTY device names
+
+      // Only attempt to open platform TTY device when explicitly forced.
+      // Attempting to open devices automatically caused stray "CON" artifacts and
+      // unreliable behavior in Windows git hook environments. Use AI_FORCE_PROMPT
+      // to opt-in. Otherwise, if non-interactive, return a cancelled result
+      // so higher-level code can follow `AI_DEFAULT_ON_CANCEL`.
+      if (needsTtyFallback && forcePrompt) {
+        // Platform-specific TTY device names (raw device paths only)
         let inputTtyPath = '/dev/tty';
         let outputTtyPath = '/dev/tty';
-        if (process.platform === 'win32') {
-          // Use Win32 console device names for raw access
-          inputTtyPath = '\\\\.\\CONIN$';
-          outputTtyPath = '\\\\.\\CONOUT$';
-        }
 
-        try {
-          // Try to open read/write streams to the terminal device.
-          inputStream = fsSync.createReadStream(inputTtyPath);
-          outputStream = fsSync.createWriteStream(outputTtyPath);
-          if (!isProd) console.log(chalk.gray(`ℹ️  Opened terminal device ${inputTtyPath}/${outputTtyPath} for interactive prompts`));
-        } catch (e) {
-          if (!forcePrompt) {
-            if (!isProd) console.log(chalk.yellow('⚠️  Unable to open terminal device for fallback prompts — aborting prompt'));
+        if (process.platform === 'win32') {
+          // On Windows, attempting to open raw console devices like
+          // "\\.\CONIN$" in hook contexts is unreliable and can result in
+          // errors or reserved-name artifacts. Prefer a readline fallback on
+          // standard streams instead of opening device paths.
+          if (!isProd) console.log(chalk.yellow('⚠️  Windows platform detected - using readline fallback instead of raw device open'));
+          try {
+            try { process.stdin.resume(); } catch (e) {}
+            try { process.stdin.setEncoding && process.stdin.setEncoding('utf8'); } catch (e) {}
+            const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+
+            const askOnce = (q) => new Promise((resolve) => {
+              if (!q || !q.type) return resolve({});
+              if (q.type === 'input') {
+                rl.question(q.message + (q.default ? ` (${q.default}) ` : ': '), answer => resolve({ [q.name]: answer || q.default }));
+              } else if (q.type === 'confirm') {
+                const def = q.default ? 'Y/n' : 'y/N';
+                rl.question(`${q.message} (${def}): `, ans => {
+                  const v = (ans || '').trim().toLowerCase();
+                  if (v === '') resolve({ [q.name]: !!q.default });
+                  else resolve({ [q.name]: ['y','yes'].includes(v) });
+                });
+              } else if (q.type === 'list') {
+                process.stdout.write(q.message + '\n');
+                q.choices.forEach((c, i) => process.stdout.write(`  ${i + 1}) ${c}\n`));
+                rl.question('Select an option number: ', ans => {
+                  const idx = parseInt((ans || '').trim(), 10) - 1;
+                  const val = q.choices[idx] !== undefined ? q.choices[idx] : q.default || q.choices[0];
+                  const out = {}; out[q.name] = val; resolve(out);
+                });
+              } else {
+                rl.question(q.message + ': ', answer => resolve({ [q.name]: answer }));
+              }
+            });
+
+            const question = Array.isArray(questions) ? questions[0] : questions;
+            const answerPromise = askOnce(question);
+            const result = timeoutMs === 0 ? await answerPromise : await Promise.race([
+              answerPromise,
+              new Promise((resolve) => setTimeout(() => resolve({ __timeout: true }), timeoutMs))
+            ]);
+            try { rl.close(); } catch (e) {}
+            if (result && result.__timeout) return { cancelled: true, answers: null };
+            return { cancelled: false, answers: result };
+          } catch (rErr) {
+            if (!isProd) console.log(chalk.yellow(`⚠️  Readline fallback failed on Windows: ${rErr.message}`));
             return { cancelled: true, answers: null };
-          } else {
-            if (!isProd) console.log(chalk.yellow('⚠️  Unable to open terminal device, but AI_FORCE_PROMPT=true — attempting inquirer with default streams'));
           }
         }
+
+        // POSIX: try to open /dev/tty for a reliable device-backed prompt
+        try {
+          inputTtyPath = '/dev/tty';
+          outputTtyPath = '/dev/tty';
+          inputStream = fsSync.createReadStream(inputTtyPath);
+          outputStream = fsSync.createWriteStream(outputTtyPath);
+          if (!isProd) console.log(chalk.gray(`ℹ️  Opened terminal device ${inputTtyPath} for interactive prompts`));
+        } catch (e) {
+          if (!isProd) console.log(chalk.yellow(`⚠️  Terminal device fallback failed: ${e.message}`));
+          // Fall back to readline on standard streams if device open fails
+          try {
+            try { process.stdin.resume(); } catch (e) {}
+            try { process.stdin.setEncoding && process.stdin.setEncoding('utf8'); } catch (e) {}
+            const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+            const question = Array.isArray(questions) ? questions[0] : questions;
+            const askOnce = (q) => new Promise((resolve) => {
+              if (!q || !q.type) return resolve({});
+              if (q.type === 'input') rl.question(q.message + (q.default ? ` (${q.default}) ` : ': '), answer => resolve({ [q.name]: answer || q.default }));
+              else if (q.type === 'confirm') rl.question(`${q.message} (${q.default ? 'Y/n' : 'y/N'}): `, ans => resolve({ [q.name]: (ans || '').trim().toLowerCase() === 'y' }));
+              else if (q.type === 'list') {
+                process.stdout.write(q.message + '\n'); q.choices.forEach((c, i) => process.stdout.write(`  ${i + 1}) ${c}\n`));
+                rl.question('Select an option number: ', ans => { const idx = parseInt((ans || '').trim(), 10) - 1; const val = q.choices[idx] !== undefined ? q.choices[idx] : q.default || q.choices[0]; const out = {}; out[q.name] = val; resolve(out); });
+              } else rl.question(q.message + ': ', answer => resolve({ [q.name]: answer }));
+            });
+            const answerPromise = askOnce(question);
+            const result = timeoutMs === 0 ? await answerPromise : await Promise.race([
+              answerPromise,
+              new Promise((resolve) => setTimeout(() => resolve({ __timeout: true }), timeoutMs))
+            ]);
+            try { rl.close(); } catch (e) {}
+            if (result && result.__timeout) return { cancelled: true, answers: null };
+            return { cancelled: false, answers: result };
+          } catch (rErr) {
+            if (!isProd) console.log(chalk.yellow(`⚠️  Readline fallback also failed: ${rErr.message}`));
+            return { cancelled: true, answers: null };
+          }
+        }
+      } else if (needsTtyFallback && !forcePrompt) {
+        // Non-interactive and not forcing prompts: return cancelled so that
+        // callers use AI_DEFAULT_ON_CANCEL behavior instead of attempting to
+        // prompt and risk hanging or creating artifacts.
+        if (!isProd) console.log(chalk.yellow('⚠️  Non-interactive terminal detected - skipping prompts (AI_FORCE_PROMPT not set)'));
+        return { cancelled: true, answers: null };
       }
 
       const promptModule = inquirer.createPromptModule({ input: inputStream, output: outputStream });
@@ -199,6 +425,7 @@ async function getCopilotReview(diff) {
       { regex: /document\.getElementById/i, message: "Direct DOM manipulation", severity: "medium", fix: "Consider using modern frameworks or query caching" }
     ],
     modernJS: [
+      { regex: /\.indexOf\(/i, message: "Legacy indexOf usage", severity: "low", fix: "Use .includes() for better readability" },
       { regex: /var\s+/i, message: "Legacy var declaration", severity: "medium", fix: "Use 'const' for constants, 'let' for variables" },
       { regex: /==\s*null|!=\s*null/i, message: "Loose equality with null", severity: "medium", fix: "Use strict equality: === null or !== null" },
       { regex: /function\s+\w+\s*\(/i, message: "Traditional function syntax", severity: "low", fix: "Consider arrow functions for consistency and lexical this" },
@@ -613,6 +840,9 @@ export async function validateCommit() {
   console.log(chalk.green("\n🤖 Copilot Analysis Complete:\n"));
   console.log(chalk.white(aiFeedback));
 
+  // Automatically open files at error locations if enabled
+  await openErrorLocations(aiFeedback, stagedFiles);
+
   // Surface Copilot suggestion summaries clearly before prompting the user
   try {
     const copilotFixesMatch = aiFeedback.match(/COPILOT_FIXES[\s\S]*?(?=\n\n|AUTO_APPLICABLE_FIXES|$)/);
@@ -725,7 +955,7 @@ export async function validateCommit() {
           console.log(chalk.cyan("⚡ Skipping AI validation and proceeding with commit (configured default)"));
           process.exit(0);
         } else {
-          console.log(chalk.red("❌ Commit cancelled due to prompt timeout (configured default)."));
+          console.log(chalk.red("❌ Commit cancelled due to issues found (no action selected)."));
           process.exit(1);
         }
       } else {
@@ -1122,10 +1352,11 @@ async function applyAISuggestions(suggestedFixes, stagedFiles) {
 async function autoApplyAndRecommit(autoFixes, stagedFiles) {
   // Check if these are fallback fixes (no real auto-apply available)
   if (autoFixes.length > 0 && autoFixes[0].type === 'fallback') {
-    console.log(chalk.yellow("\\n📋 Manual code review recommended"));
-    console.log(chalk.cyan("💡 Auto-apply not available - improvements need manual review"));
-    console.log(chalk.green("✅ Proceeding with commit - please review suggestions above"));
-    process.exit(0);
+    console.log(chalk.red("\\n❌ Commit rejected: Code issues found"));
+    console.log(chalk.yellow("📋 Manual code review required"));
+    console.log(chalk.cyan("💡 Auto-apply not available - please review suggestions above and fix manually"));
+    console.log(chalk.gray("🔍 Issues detected - fix them and commit again"));
+    process.exit(1);
   }
   
   console.log(chalk.cyan("\\n🚀 Auto-applying Copilot suggestions..."));
