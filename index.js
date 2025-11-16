@@ -4,6 +4,7 @@ import chalk from "chalk";
 import inquirer from "inquirer";
 import dotenv from "dotenv";
 import fs from "fs/promises";
+import fsSync from 'fs';
 import path from "path";
 import { execSync } from "child_process";
 
@@ -36,16 +37,51 @@ async function safePrompt(questions, opts = {}) {
   // Configurable timeout (ms). If set to 0, disable timeout (wait indefinitely).
   const timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : parseInt(process.env.AI_PROMPT_TIMEOUT_MS || '30000');
 
-  // If stdin is not a TTY (non-interactive environment), avoid showing prompts
-  // because they will not accept input. Return as cancelled so caller can
-  // follow the configured DEFAULT_ON_CANCEL behavior.
+  // Allow forcing prompts even when stdin isn't a TTY (use with caution).
+  const forcePrompt = (process.env.AI_FORCE_PROMPT || 'false').toLowerCase() === 'true';
+
+  // If stdin is not a TTY (non-interactive environment) we normally skip
+  // interactive prompts because they won't accept input. However, if the
+  // caller explicitly sets AI_FORCE_PROMPT=true we will attempt a fallback
+  // interactive prompt using inquirer's prompt module (may or may not work
+  // depending on the environment). Use with caution.
   if (!process.stdin || !process.stdin.isTTY) {
-    if (!isProd) console.log(chalk.yellow('⚠️  Non-interactive terminal detected - skipping interactive prompts'));
-    return { cancelled: true, answers: null, nonInteractive: true };
+    if (!forcePrompt) {
+      if (!isProd) console.log(chalk.yellow('⚠️  Non-interactive terminal detected - skipping interactive prompts (set AI_FORCE_PROMPT=true to attempt fallback)'));
+      return { cancelled: true, answers: null, nonInteractive: true };
+    } else {
+      if (!isProd) console.log(chalk.yellow('⚠️  Non-interactive terminal detected but AI_FORCE_PROMPT=true — attempting fallback interactive prompt'));
+      // fall through to try prompting with a created prompt module
+    }
   }
 
   try {
-    const p = inquirer.prompt(questions);
+      // Use an inquirer prompt module and, when stdin/stdout are not TTY,
+      // try opening the platform TTY device so prompts still work in hooks.
+      let inputStream = process.stdin;
+      let outputStream = process.stdout;
+
+      const needsTtyFallback = !process.stdin || !process.stdin.isTTY || !process.stdout || !process.stdout.isTTY;
+      if (needsTtyFallback) {
+        // Platform-specific TTY path: use CON on Windows, /dev/tty on POSIX
+        const ttyPath = process.platform === 'win32' ? 'CON' : '/dev/tty';
+        try {
+          // Try to open read/write streams to the terminal device.
+          inputStream = fsSync.createReadStream(ttyPath);
+          outputStream = fsSync.createWriteStream(ttyPath);
+          if (!isProd) console.log(chalk.gray(`ℹ️  Opened terminal device ${ttyPath} for interactive prompts`));
+        } catch (e) {
+          if (!forcePrompt) {
+            if (!isProd) console.log(chalk.yellow('⚠️  Unable to open terminal device for fallback prompts — aborting prompt'));
+            return { cancelled: true, answers: null };
+          } else {
+            if (!isProd) console.log(chalk.yellow('⚠️  Unable to open terminal device, but AI_FORCE_PROMPT=true — attempting inquirer with default streams'));
+          }
+        }
+      }
+
+      const promptModule = inquirer.createPromptModule({ input: inputStream, output: outputStream });
+      const p = promptModule(questions);
 
     // If timeoutMs is 0, wait indefinitely for user input.
     const res = timeoutMs === 0 ? await p : await Promise.race([
@@ -1128,6 +1164,14 @@ async function autoApplyAndRecommit(autoFixes, stagedFiles) {
           }
           
           // Write improved content
+          // Before writing, allow interactive per-file review when possible
+          const accepted = await interactiveReviewAndApply(filename, originalContent, modifiedContent);
+
+          if (!accepted) {
+            console.log(chalk.yellow(`⚠️  Skipping applying changes to ${filename} (user chose to keep local changes)`));
+            continue; // do not write or stage this file
+          }
+
           await fs.writeFile(filePath, modifiedContent);
           appliedFiles.push({
             filename: filename,
@@ -1292,5 +1336,72 @@ async function applyAutoFixesNoCommit(autoFixes, stagedFiles) {
     } catch (error) {
       console.log(chalk.red(`❌ Error saving fixes to ${filename}: ${error.message}`));
     }
+  }
+}
+
+// Interactive per-file review: shows original vs improved content and asks user to accept
+async function interactiveReviewAndApply(filename, originalContent, improvedContent) {
+  // If running in a non-interactive terminal and user didn't force prompts,
+  // decide based on DEFAULT_ON_CANCEL: 'auto-apply' => accept, 'skip' => reject, 'cancel' => cancel whole flow
+  const nonInteractive = !process.stdin || !process.stdin.isTTY;
+  const forcePrompt = (process.env.AI_FORCE_PROMPT || 'false').toLowerCase() === 'true';
+
+  if (nonInteractive && !forcePrompt) {
+    if (DEFAULT_ON_CANCEL === 'auto-apply') return true;
+    if (DEFAULT_ON_CANCEL === 'skip') return false;
+    // DEFAULT_ON_CANCEL === 'cancel' -> treat as reject (higher-level flow will cancel)
+    return false;
+  }
+
+  // Print a concise diff-like view: show changed lines with context
+  const origLines = originalContent.split(/\r?\n/);
+  const newLines = improvedContent.split(/\r?\n/);
+  const maxLen = Math.max(origLines.length, newLines.length);
+
+  console.log(chalk.magenta(`\n--- Suggested changes for: ${filename}`));
+  console.log(chalk.gray('  (Lines prefixed with - are original; + are suggested improvements)'));
+
+  for (let i = 0; i < maxLen; i++) {
+    const o = origLines[i] !== undefined ? origLines[i] : '';
+    const n = newLines[i] !== undefined ? newLines[i] : '';
+    if (o === n) {
+      // print unchanged lines sparsely for context only when nearby changes exist
+      // to avoid flooding, show unchanged lines only if within 2 lines of a change
+      const prevChanged = (i > 0 && origLines[i-1] !== newLines[i-1]);
+      const nextChanged = (i < maxLen-1 && origLines[i+1] !== newLines[i+1]);
+      if (prevChanged || nextChanged) {
+        console.log('  ' + o);
+      }
+    } else {
+      console.log(chalk.red(`- ${o}`));
+      console.log(chalk.green(`+ ${n}`));
+    }
+  }
+
+  // Use safePrompt for robust input handling
+  try {
+    const { cancelled, answers } = await safePrompt([
+      {
+        type: 'confirm',
+        name: 'apply',
+        message: `Apply suggested changes to ${filename}?`,
+        default: true
+      }
+    ], { timeoutMs: 30000 });
+
+    if (cancelled) {
+      // Fallback to configured default when prompt times out or is cancelled
+      if (DEFAULT_ON_CANCEL === 'auto-apply') return true;
+      if (DEFAULT_ON_CANCEL === 'skip') return false;
+      return false;
+    }
+
+    return !!answers.apply;
+  } catch (err) {
+    if (err && (err.name === 'ExitPromptError' || /User force closed|cancelled/i.test(err.message))) {
+      if (DEFAULT_ON_CANCEL === 'auto-apply') return true;
+      return false;
+    }
+    throw err;
   }
 }
