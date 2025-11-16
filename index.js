@@ -33,19 +33,32 @@ if (githubToken) {
 
 // Safe prompt wrapper to handle Windows PowerShell input issues
 async function safePrompt(questions, opts = {}) {
-  const timeoutMs = opts.timeoutMs || 30000;
+  // Configurable timeout (ms). If set to 0, disable timeout (wait indefinitely).
+  const timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : parseInt(process.env.AI_PROMPT_TIMEOUT_MS || '30000');
+
+  // If stdin is not a TTY (non-interactive environment), avoid showing prompts
+  // because they will not accept input. Return as cancelled so caller can
+  // follow the configured DEFAULT_ON_CANCEL behavior.
+  if (!process.stdin || !process.stdin.isTTY) {
+    if (!isProd) console.log(chalk.yellow('⚠️  Non-interactive terminal detected - skipping interactive prompts'));
+    return { cancelled: true, answers: null, nonInteractive: true };
+  }
+
   try {
     const p = inquirer.prompt(questions);
-    const res = await Promise.race([
+
+    // If timeoutMs is 0, wait indefinitely for user input.
+    const res = timeoutMs === 0 ? await p : await Promise.race([
       p,
       new Promise((resolve) => setTimeout(() => resolve({ __timeout: true }), timeoutMs)),
     ]);
+
     if (res && res.__timeout) {
       return { cancelled: true, answers: null };
     }
     return { cancelled: false, answers: res };
   } catch (e) {
-    if (e.name === 'ExitPromptError' || /User force closed|cancelled/i.test(e.message)) {
+    if (e && (e.name === 'ExitPromptError' || /User force closed|cancelled/i.test(e.message))) {
       return { cancelled: true, answers: null };
     }
     throw e;
