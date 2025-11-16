@@ -58,13 +58,20 @@ async function safePrompt(questions, opts = {}) {
 
       const needsTtyFallback = !process.stdin || !process.stdin.isTTY || !process.stdout || !process.stdout.isTTY;
       if (needsTtyFallback) {
-        // Platform-specific TTY path: use CON on Windows, /dev/tty on POSIX
-        const ttyPath = process.platform === 'win32' ? 'CON' : '/dev/tty';
+        // Platform-specific TTY device names
+        let inputTtyPath = '/dev/tty';
+        let outputTtyPath = '/dev/tty';
+        if (process.platform === 'win32') {
+          // Use Win32 console device names for raw access
+          inputTtyPath = '\\\\.\\CONIN$';
+          outputTtyPath = '\\\\.\\CONOUT$';
+        }
+
         try {
           // Try to open read/write streams to the terminal device.
-          inputStream = fsSync.createReadStream(ttyPath);
-          outputStream = fsSync.createWriteStream(ttyPath);
-          if (!isProd) console.log(chalk.gray(`ℹ️  Opened terminal device ${ttyPath} for interactive prompts`));
+          inputStream = fsSync.createReadStream(inputTtyPath);
+          outputStream = fsSync.createWriteStream(outputTtyPath);
+          if (!isProd) console.log(chalk.gray(`ℹ️  Opened terminal device ${inputTtyPath}/${outputTtyPath} for interactive prompts`));
         } catch (e) {
           if (!forcePrompt) {
             if (!isProd) console.log(chalk.yellow('⚠️  Unable to open terminal device for fallback prompts — aborting prompt'));
