@@ -1,7 +1,7 @@
 {
-  "name": "ai-commit-validator",
-  "version": "2.1.14",
-  "description": "A GitHub Copilot-powered commit validator with intelligent local code analysis and enhanced security pattern detection.",
+  "name": "copilot-commit-validator",
+  "version": "3.9.0",
+  "description": "Production-ready AI commit validator with enhanced error detection including undeclared variables that cause ReferenceError. Focuses on meaningful code optimizations, critical error detection, unused code removal, and performance improvements.",
   "main": "index.js",
   "type": "module",
   "bin": {

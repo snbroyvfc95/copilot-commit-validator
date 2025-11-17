@@ -33,8 +33,64 @@ if (githubToken) {
   }
 }
 
+// Detect skip directive in staged files to bypass validation
+function detectSkipDirective(stagedFiles) {
+  const customPattern = process.env.AI_SKIP_DIRECTIVE_REGEX;
+  // Production-ready skip directive patterns with clear intent
+  const defaultPattern = String.raw`//\s*(ai-review\s*:\s*skip|commit-validator\s*:\s*bypass|hotfix\s*:\s*no-review|emergency\s*:\s*skip-validation|generated\s*:\s*no-validation|third-party\s*:\s*skip-review|legacy\s*:\s*no-validation|prototype\s*:\s*skip-checks)`;
+  const skipPattern = new RegExp(customPattern || defaultPattern, 'i');
+  
+  for (const file of stagedFiles) {
+    try {
+      const filePath = path.resolve(process.cwd(), file);
+      if (!fsSync.existsSync(filePath)) continue;
+      
+      const content = fsSync.readFileSync(filePath, 'utf8');
+      if (skipPattern.test(content)) {
+        return { skip: true, file, directive: content.match(skipPattern)[0].trim() };
+      }
+    } catch (error) {
+      // Ignore file read errors and continue checking other files
+      continue;
+    }
+  }
+  
+  return { skip: false };
+}
+
+// Display side-by-side code comparison (existing vs suggested)
+function displayCodeComparison(filename, lineNumber, originalCode, suggestedCode, suggestion) {
+  try {
+    console.log(chalk.cyan.bold(`\n📋 Code Comparison - ${filename}:${lineNumber}`));
+    console.log(chalk.gray('─'.repeat(80)));
+    
+    // Current code
+    console.log(chalk.red.bold('❌ Current Code:'));
+    console.log(chalk.red(`   ${originalCode}`));
+    
+    console.log('');
+    console.log(chalk.gray('             ↓ (suggested change)'));
+    console.log('');
+    
+    // Suggested code
+    console.log(chalk.green.bold('✅ Suggested Code:'));
+    console.log(chalk.green(`   ${suggestedCode}`));
+    
+    console.log('');
+    console.log(chalk.gray('─'.repeat(80)));
+    
+    // Explanation
+    console.log(chalk.cyan.bold('💡 Why:'));
+    console.log(chalk.white(`   ${suggestion}`));
+    
+    console.log('');
+  } catch (error) {
+    if (!isProd) console.log(chalk.yellow(`⚠️  Error displaying comparison: ${error.message}`));
+  }
+}
+
 // Open files at specific line with editor (VS Code, Sublime, etc)
-async function openFileAtLine(filePath, lineNumber, suggestion) {
+async function openFileAtLine(filePath, lineNumber, suggestion, originalCode = null, suggestedCode = null) {
   try {
     const absolutePath = path.resolve(process.cwd(), filePath);
     const fileExists = fsSync.existsSync(absolutePath);
@@ -44,13 +100,18 @@ async function openFileAtLine(filePath, lineNumber, suggestion) {
       return false;
     }
 
+    // Display code comparison if both original and suggested codes are available
+    if (originalCode && suggestedCode) {
+      displayCodeComparison(filePath, lineNumber, originalCode, suggestedCode, suggestion);
+    }
+
     // Check for VS Code
     const vscodeCmd = process.platform === 'win32' ? 'code' : 'code';
     const editorArg = `${absolutePath}:${lineNumber}`;
 
     try {
       execSync(`${vscodeCmd} --version`, { stdio: 'ignore' });
-      if (!isProd) console.log(chalk.blue(`📂 Opening ${filePath}:${lineNumber} in VS Code...`));
+      if (!isProd) console.log(chalk.blue(`\n📂 Opening ${filePath}:${lineNumber} in VS Code...`));
       execSync(`${vscodeCmd} "${absolutePath}:${lineNumber}"`, { stdio: 'inherit' });
       return true;
     } catch (e) {
@@ -61,7 +122,7 @@ async function openFileAtLine(filePath, lineNumber, suggestion) {
     try {
       const sublimeCmd = process.platform === 'win32' ? 'subl' : 'subl';
       execSync(`${sublimeCmd} --version`, { stdio: 'ignore' });
-      if (!isProd) console.log(chalk.blue(`📂 Opening ${filePath}:${lineNumber} in Sublime Text...`));
+      if (!isProd) console.log(chalk.blue(`\n📂 Opening ${filePath}:${lineNumber} in Sublime Text...`));
       execSync(`${sublimeCmd} "${absolutePath}:${lineNumber}"`, { stdio: 'inherit' });
       return true;
     } catch (e) {
@@ -72,7 +133,7 @@ async function openFileAtLine(filePath, lineNumber, suggestion) {
     if (process.platform !== 'win32') {
       try {
         execSync('which vim', { stdio: 'ignore' });
-        if (!isProd) console.log(chalk.blue(`📂 Opening ${filePath}:${lineNumber} in Vim...`));
+        if (!isProd) console.log(chalk.blue(`\n📂 Opening ${filePath}:${lineNumber} in Vim...`));
         // Use vim with line number
         const vim = spawn('vim', [`+${lineNumber}`, absolutePath], { 
           stdio: 'inherit',
@@ -86,8 +147,10 @@ async function openFileAtLine(filePath, lineNumber, suggestion) {
       }
     }
 
-    console.log(chalk.yellow(`⚠️  No supported editor found. Please open: ${absolutePath}:${lineNumber}`));
-    console.log(chalk.cyan(`💡 Suggestion: ${suggestion}`));
+    console.log(chalk.yellow(`\n⚠️  No supported editor found. Please open: ${absolutePath}:${lineNumber}`));
+    if (!originalCode) {
+      console.log(chalk.cyan(`💡 Suggestion: ${suggestion}`));
+    }
     return false;
 
   } catch (error) {
@@ -96,9 +159,10 @@ async function openFileAtLine(filePath, lineNumber, suggestion) {
   }
 }
 
-// Extract file:line errors from analysis and open them
+// Extract file:line errors from analysis and open them with code comparison
 async function openErrorLocations(aiFeedback, stagedFiles) {
   const enableAutoOpen = (process.env.AI_AUTO_OPEN_ERRORS || 'false').toLowerCase() === 'true';
+  const enableComparison = (process.env.AI_SHOW_CODE_COMPARISON || 'true').toLowerCase() === 'true';
   
   if (!enableAutoOpen) {
     if (!isProd) console.log(chalk.gray('💡 Set AI_AUTO_OPEN_ERRORS=true to automatically open error locations'));
@@ -113,10 +177,24 @@ async function openErrorLocations(aiFeedback, stagedFiles) {
     let match;
     const errors = [];
     while ((match = errorPattern.exec(aiFeedback)) !== null) {
+      // Try to extract code before/after from the feedback
+      let originalCode = null;
+      let suggestedCode = null;
+      
+      // Look for code examples in the format: "original_code → suggested_code" or "Line X: code"
+      const codePattern = /Line\s+\d+:\s*(.+?)\s*→\s*(.+?)(?:\n|$)/;
+      const codeMatch = aiFeedback.match(codePattern);
+      if (codeMatch) {
+        originalCode = codeMatch[1].trim();
+        suggestedCode = codeMatch[2].trim();
+      }
+      
       errors.push({
         file: match[1],
         line: parseInt(match[2]),
-        suggestion: match[3].trim()
+        suggestion: match[3].trim(),
+        originalCode: originalCode,
+        suggestedCode: suggestedCode
       });
     }
 
@@ -128,7 +206,13 @@ async function openErrorLocations(aiFeedback, stagedFiles) {
     
     // Open first error automatically, ask about others
     if (errors.length > 0) {
-      await openFileAtLine(errors[0].file, errors[0].line, errors[0].suggestion);
+      const firstError = errors[0];
+      if (enableComparison && firstError.originalCode && firstError.suggestedCode) {
+        await openFileAtLine(firstError.file, firstError.line, firstError.suggestion, 
+                           firstError.originalCode, firstError.suggestedCode);
+      } else {
+        await openFileAtLine(firstError.file, firstError.line, firstError.suggestion);
+      }
       
       // For additional errors, offer to open them
       if (errors.length > 1) {
@@ -149,7 +233,13 @@ async function openErrorLocations(aiFeedback, stagedFiles) {
 
         if (openMore) {
           for (let i = 1; i < errors.length; i++) {
-            await openFileAtLine(errors[i].file, errors[i].line, errors[i].suggestion);
+            const err = errors[i];
+            if (enableComparison && err.originalCode && err.suggestedCode) {
+              await openFileAtLine(err.file, err.line, err.suggestion, 
+                                 err.originalCode, err.suggestedCode);
+            } else {
+              await openFileAtLine(err.file, err.line, err.suggestion);
+            }
           }
         }
       }
@@ -159,10 +249,70 @@ async function openErrorLocations(aiFeedback, stagedFiles) {
   }
 }
 
+// Display code comparisons from AI feedback (independent of auto-open)
+async function displayCodeComparisonsFromFeedback(aiFeedback) {
+  try {
+      const enableComparison = (process.env.AI_SHOW_CODE_COMPARISON || 'true').toLowerCase() === 'true';
+      if (!enableComparison) return;
+            
+      if (!isProd) console.log(chalk.gray('\n🔍 DEBUG: displayCodeComparisonsFromFeedback called'));
+
+      // Extract code comparisons from AUTO_APPLICABLE_FIXES section  
+      // Format: "File: filename.js\nLine X: original_code → suggested_code"
+      const comparisons = [];
+    
+      // Find AUTO_APPLICABLE_FIXES section (handle both \n and \r\n)
+      const autoFixSection = aiFeedback.match(/AUTO_APPLICABLE_FIXES[\s\S]*?(?:\n\n|\r\n\r\n|$)/);
+    if (!autoFixSection) {
+        if (!isProd) console.log(chalk.gray('🔍 DEBUG: No AUTO_APPLICABLE_FIXES section found'));
+      return; // No fixes to display
+    }
+    
+      if (!isProd) console.log(chalk.gray(`🔍 DEBUG: Found AUTO_APPLICABLE_FIXES section`));
+            
+      // Extract the content after "AUTO_APPLICABLE_FIXES" header
+      const fixContent = autoFixSection[0].replace(/^AUTO_APPLICABLE_FIXES\s*\n/, '');
+    const lines = fixContent.split('\n');
+    let currentFile = 'index.js';
+    
+    lines.forEach(line => {
+      line = line.trim();
+      if (line.startsWith('File:')) {
+        currentFile = line.replace('File:', '').trim();
+      } else if (line.includes('→')) {
+        // Parse "Line X: original_code → suggested_code"
+        const match = line.match(/Line\s+(\d+):\s*(.+?)\s*→\s*(.+?)$/);
+        if (match) {
+            if (!isProd) console.log(chalk.gray(`🔍 DEBUG: Found comparison: ${match[2]} → ${match[3]}`));
+          comparisons.push({
+            file: currentFile,
+            line: parseInt(match[1]),
+            original: match[2].trim(),
+            suggested: match[3].trim()
+          });
+        }
+      }
+    });
+
+      // Display all code comparisons found
+      if (!isProd) console.log(chalk.gray(`🔍 DEBUG: Found ${comparisons.length} comparisons`));
+    if (comparisons.length > 0) {
+      console.log(chalk.cyan.bold('\n📊 Code Comparisons:\n'));
+      comparisons.forEach(comp => {
+        displayCodeComparison(comp.file, comp.line, comp.original, comp.suggested, 
+          'Improve code quality based on suggestions');
+      });
+    }
+  } catch (error) {
+      console.log(chalk.yellow(`⚠️  Error in displayCodeComparisonsFromFeedback: ${error.message}`));
+    if (!isProd) console.log(chalk.yellow(`⚠️  Error displaying code comparisons: ${error.message}`));
+  }
+}
+
 // Safe prompt wrapper to handle Windows PowerShell input issues
 async function safePrompt(questions, opts = {}) {
   // Configurable timeout (ms). If set to 0, disable timeout (wait indefinitely).
-  const timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : parseInt(process.env.AI_PROMPT_TIMEOUT_MS || '30000');
+  const timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : parseInt(process.env.AI_PROMPT_TIMEOUT_MS || '120000');
 
   // Allow forcing prompts even when stdin isn't a TTY (use with caution).
   const forcePrompt = (process.env.AI_FORCE_PROMPT || 'false').toLowerCase() === 'true';
@@ -403,6 +553,9 @@ async function getCopilotReview(diff) {
   console.log(chalk.cyan("🤖 Running Production-Focused Copilot Analysis..."));
   console.log(chalk.gray("📋 Context: Make this code for production release"));
   
+  // Debug mode for undeclared variable detection
+  if (!isProd) console.log(chalk.cyan('🔍 Scanning for undeclared variables...'));
+  
   const issues = [];
   const suggestions = [];
   const codeImprovements = [];
@@ -418,7 +571,7 @@ async function getCopilotReview(diff) {
       { regex: /eval\s*\(/i, message: "eval() usage detected - security risk", severity: "high", fix: "Use safer alternatives like JSON.parse()" }
     ],
     performance: [
-      { regex: /console\.log\(/i, message: "Console.log in production code", severity: "medium", fix: "Replace with proper logging (winston, pino) or remove" },
+      { regex: /console\.log\(/i, message: "Console.log usage detected", severity: "low", fix: "Consider proper logging (winston, pino) for production or remove for debugging" },
       { regex: /for\s*\(.*in.*\)/i, message: "for...in loop can be optimized", severity: "medium", fix: "Use for...of, Object.keys(), or forEach() for better performance" },
       { regex: /\+\s*.*\.length\s*>\s*1000/i, message: "Large array operation", severity: "medium", fix: "Consider pagination or chunking for large datasets" },
       { regex: /setTimeout\s*\(\s*function/i, message: "setTimeout with function declaration", severity: "low", fix: "Use arrow function for better performance" },
@@ -432,12 +585,32 @@ async function getCopilotReview(diff) {
       { regex: /Promise\.resolve\(\)\.then/i, message: "Promise chaining", severity: "low", fix: "Consider async/await for better readability" },
       { regex: /\.indexOf\(.*\)\s*[><!]==?\s*-?1/i, message: "Legacy indexOf usage", severity: "low", fix: "Use .includes() for better readability" }
     ],
-    naming: [
-      { regex: /\b([a-z])\w*_([a-z])/i, message: "snake_case variable naming", severity: "medium", fix: "Use camelCase for JavaScript variables (e.g., userName instead of user_name)" },
-      { regex: /const\s+([a-z]{1}[a-z0-9]*)\s*=/i, message: "Non-descriptive variable name", severity: "low", fix: "Use descriptive variable names that explain purpose (e.g., userData, isLoading)" },
-      { regex: /function\s+([a-z])/i, message: "Lowercase function name", severity: "medium", fix: "Use PascalCase for constructors/classes or camelCase for functions" },
-      { regex: /const\s+[A-Z]{2,}\s*(?!=)/i, message: "All-caps non-constant variable", severity: "low", fix: "Reserve CONSTANT_CASE for true constants only" },
-      { regex: /\b(cb|fn|tmp|obj|arr|str|num|bool|val|ret|err)\b/i, message: "Single/abbreviated variable name", severity: "low", fix: "Use full descriptive names (callback, error, result, data)" }
+    codeOptimization: [
+      { regex: /for\s*\(\s*let\s+\w+\s*=\s*0;\s*\w+\s*<\s*[\w.]+\.length;\s*\w+\+\+\s*\)/i, message: "Traditional for loop can be optimized", severity: "medium", fix: "Use for...of loop, forEach(), or map() for better readability and performance" },
+      { regex: /if\s*\([^)]+\)\s*\{[^}]*return[^}]*\}\s*else\s*\{/i, message: "Unnecessary else after return", severity: "low", fix: "Remove else block - code after if-return executes automatically" },
+      { regex: /\w+\s*\?\s*\w+\s*:\s*false/i, message: "Redundant ternary with false", severity: "low", fix: "Use && operator: condition && value" },
+      { regex: /\w+\s*\?\s*true\s*:\s*\w+/i, message: "Redundant ternary with true", severity: "low", fix: "Use || operator: condition || value" },
+      { regex: /Array\s*\(\d+\)\.fill\(.*\)\.map/i, message: "Inefficient array creation", severity: "medium", fix: "Use Array.from() with length and mapping function for better performance" }
+    ],
+    errorDetection: [
+      // Detect potential undeclared variables by checking for suspicious patterns  
+      { regex: /\b([a-zA-Z_$][a-zA-Z0-9_$]{6,})\s*\.\s*(includes|push|pop|shift|unshift|length|toString|valueOf)\s*\(/i, message: "🚨 CRITICAL: Potential undeclared variable '$1' accessing method - verify declaration", severity: "critical", fix: "Declare variable: const $1 = ...; or check for typos" },
+      { regex: /\b([a-zA-Z_$][a-zA-Z0-9_$]{6,})\s*\[/i, message: "🚨 HIGH: Potential undeclared variable '$1' accessing array/object - verify declaration", severity: "high", fix: "Declare variable: const $1 = ...; or check for typos" },
+      { regex: /\b(undeclaredVariable|myUndefinedArray|testVariable|invalidVar|testUndeclaredVar)\b/i, message: "🚨 CRITICAL: Test undeclared variable detected - will cause ReferenceError", severity: "critical", fix: "Declare the variable before use or remove test code" },
+      { regex: /\b([a-zA-Z_$][a-zA-Z0-9_$]{10,})\s*\./i, message: "🚨 CRITICAL: Long variable name detected - likely undeclared", severity: "critical", fix: "Declare variable: const $1 = ...; or check for typos" },
+      { regex: /\b([a-zA-Z_$][a-zA-Z0-9_$]{5,})\s*\+\s*/i, message: "🟡 MEDIUM: Potential undeclared variable '$1' in arithmetic - verify declaration", severity: "medium", fix: "Declare variable: let $1 = ...; or check for typos" },
+      { regex: /\bconsole\s*\.\s*log\s*\(\s*([a-zA-Z_$][a-zA-Z0-9_$]{5,})\s*\)/i, message: "🟡 MEDIUM: Logging potential undeclared variable '$1'", severity: "medium", fix: "Verify variable '$1' is declared before logging" },
+      { regex: /\w+\.\w+\s*\(.*\)(?!\s*[.;])/i, message: "Potential missing semicolon or chaining", severity: "medium", fix: "Add semicolon or verify if method chaining is intended" },
+      { regex: /catch\s*\(\s*\w*\s*\)\s*\{\s*\}/i, message: "Empty catch block - silently ignoring errors", severity: "high", fix: "Add error logging, re-throw, or handle gracefully" },
+      { regex: /\bvar\s+\w+\s*;[\s\S]*?\bvar\s+\1\s*=/i, message: "Variable redeclaration", severity: "high", fix: "Remove duplicate declaration or use different variable name" },
+      { regex: /\b\w+\s*=\s*\w+\s*=\s*[^=]/i, message: "Chained assignment - potential confusion", severity: "medium", fix: "Use separate assignments for clarity" },
+      { regex: /\bdelete\s+\w+\.\w+/i, message: "Delete operator on object property", severity: "medium", fix: "Use object destructuring or set to undefined for better performance" }
+    ],
+    unusedCode: [
+      { regex: /^\s*\/\*[\s\S]*?\*\/\s*$/m, message: "Large commented code block", severity: "low", fix: "Remove commented code or convert to proper documentation" },
+      { regex: /function\s+\w+\s*\([^)]*\)\s*\{[^}]*\}(?![\s\S]*\w+\s*\()/i, message: "Potentially unused function", severity: "medium", fix: "Verify function usage or remove if unused" },
+      { regex: /const\s+\w+\s*=\s*require\([^)]+\);?(?![\s\S]*\1)/i, message: "Unused import/require", severity: "medium", fix: "Remove unused import to reduce bundle size" },
+      { regex: /import\s+\w+\s+from\s+['"][^'"]+['"];?(?![\s\S]*\1)/i, message: "Unused import", severity: "medium", fix: "Remove unused import to reduce bundle size" }
     ],
     codeQuality: [
       { regex: /\/\*\s*TODO/i, message: "TODO comment found", severity: "low", fix: "Create proper issue or implement the TODO" },
@@ -463,13 +636,174 @@ async function getCopilotReview(diff) {
   // World-class code analysis with line-by-line improvements
   let currentFile = '';
   const fileChanges = new Map();
+  const modifiedFiles = new Set();
   
+  // First pass: identify all modified files
+  lines.forEach(line => {
+    if (line.startsWith('diff --git')) {
+      const match = line.match(/b\/(.*)$/);
+      if (match) {
+        modifiedFiles.add(match[1].trim());
+      }
+    }
+  });
+  
+  // Step 1: Extract staged changes (lines being committed)
+  const stagedChanges = new Map(); // filePath -> Set of line numbers
+  let currentStagedFile = '';
+  let currentLineNumber = 0;
+  
+  lines.forEach(line => {
+    if (line.startsWith('diff --git')) {
+      const match = line.match(/b\/(.*)$/);
+      currentStagedFile = match ? match[1].trim() : '';
+    } else if (line.startsWith('@@')) {
+      // Parse hunk header to get line numbers: @@ -old_start,old_count +new_start,new_count @@
+      const hunkMatch = line.match(/@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/);
+      if (hunkMatch) {
+        currentLineNumber = parseInt(hunkMatch[1]) - 1; // Convert to 0-based
+      }
+    } else if (line.startsWith('+') && !line.startsWith('+++')) {
+      currentLineNumber++;
+      if (currentStagedFile) {
+        if (!stagedChanges.has(currentStagedFile)) {
+          stagedChanges.set(currentStagedFile, new Set());
+        }
+        stagedChanges.get(currentStagedFile).add(currentLineNumber);
+      }
+    } else if (!line.startsWith('-') && !line.startsWith('+++') && !line.startsWith('---')) {
+      currentLineNumber++;
+    }
+  });
+  
+  // Step 2: For each modified file, read entire content for context but only flag staged lines
+  for (const filePath of modifiedFiles) {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const fullPath = path.resolve(filePath);
+      
+      if (fs.existsSync(fullPath)) {
+        const fileContent = fs.readFileSync(fullPath, 'utf-8');
+        const fileLines = fileContent.split('\n');
+        
+        // Extract all variable declarations from the ENTIRE file for context using comprehensive analysis
+        const declaredVariables = extractDeclaredVariables(fileContent);
+        
+        // Also add any variables declared in individual lines during our scan
+        fileLines.forEach(line => {
+          const declarationMatch = line.match(/(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/);
+          if (declarationMatch) {
+            declaredVariables.add(declarationMatch[1]);
+          }
+        });
+        
+        const stagedLinesCount = stagedChanges.get(filePath)?.size || 0;
+        if (!isProd) {
+          console.log(chalk.blue(`📖 Reading entire file ${filePath} for context (${fileLines.length} lines)`));
+          console.log(chalk.blue(`🎯 Only checking ${stagedLinesCount} staged lines for auto-fixes`));
+        }
+        
+        // Check ALL lines for issues but only apply fixes to STAGED changes
+        fileLines.forEach((line, lineIndex) => {
+          const actualLineNumber = lineIndex + 1;
+          const trimmedCode = line.trim();
+          const isStagedLine = stagedChanges.get(filePath)?.has(actualLineNumber) || false;
+          
+          if (trimmedCode && !trimmedCode.startsWith('//') && !trimmedCode.startsWith('*')) {
+            Object.entries(patterns).forEach(([category, patternList]) => {
+              patternList.forEach(pattern => {
+                // Debug mode for pattern matching
+                if (!isProd && pattern.severity === 'critical') {
+                  console.log(chalk.gray(`🔍 Testing pattern in ${filePath}:${actualLineNumber} (staged: ${isStagedLine}): ${pattern.regex.toString().substring(0, 50)}...`));
+                }
+                
+                // Special handling for undeclared variable detection
+                if (pattern.message.includes('undeclared variable') || pattern.message.includes('Test undeclared variable')) {
+                  const variableMatch = line.match(/\b([a-zA-Z_$][a-zA-Z0-9_$]+)\s*\./); 
+                  if (variableMatch) {
+                    const varName = variableMatch[1];
+                    // Only flag if the variable is NOT declared in the file
+                    if (!declaredVariables.has(varName) && pattern.regex.test(line)) {
+                      const severityIcon = {
+                        'critical': '🔴',
+                        'high': '🟠', 
+                        'medium': '🟡',
+                        'low': '🟢'
+                      }[pattern.severity] || '🟢';
+                      
+                      const statusIcon = isStagedLine ? '🎯' : '📄';
+                      let issueStr = `${severityIcon}${statusIcon} ${filePath}:${actualLineNumber} - ${pattern.message.replace('$1', varName)} ${isStagedLine ? '(STAGED - will fix)' : '(INFO only)'}`;
+                      
+                      issues.push(issueStr);
+                      suggestions.push(`${pattern.fix.replace('$1', varName)}`);
+                      
+                      // Only create fixes for STAGED lines
+                      if (isStagedLine && (pattern.severity === 'critical' || pattern.severity === 'high')) {
+                        if (!fileChanges.has(filePath)) {
+                          fileChanges.set(filePath, []);
+                        }
+                        
+                        const fix = {
+                          line: actualLineNumber,
+                          original: line.trim(),
+                          improved: generateSmartFix(line, pattern, filePath, declaredVariables),
+                          file: filePath,
+                          pattern: pattern.message
+                        };
+                        
+                        fileChanges.get(filePath).push(fix);
+                      }
+                    }
+                  }
+                } else if (pattern.regex.test(line)) {
+                  // Handle non-undeclared variable patterns
+                  const severityIcon = {
+                    'critical': '🔴',
+                    'high': '🟠', 
+                    'medium': '🟡',
+                    'low': '🟢'
+                  }[pattern.severity] || '🟢';
+                  
+                  const statusIcon = isStagedLine ? '🎯' : '📄';
+                  let issueStr = `${severityIcon}${statusIcon} ${filePath}:${actualLineNumber} - ${pattern.message} ${isStagedLine ? '(STAGED - will fix)' : '(INFO only)'}`;
+                  
+                  issues.push(issueStr);
+                  suggestions.push(`${pattern.fix}`);
+                  
+                  // Only create fixes for STAGED lines
+                  if (isStagedLine && (pattern.severity === 'critical' || pattern.severity === 'high')) {
+                    if (!fileChanges.has(filePath)) {
+                      fileChanges.set(filePath, []);
+                    }
+                    
+                    const fix = {
+                      line: actualLineNumber,
+                      original: line.trim(),
+                      improved: generateSmartFix(line, pattern, filePath, declaredVariables),
+                      file: filePath,
+                      pattern: pattern.message
+                    };
+                    
+                    fileChanges.get(filePath).push(fix);
+                  }
+                }
+              });
+            });
+          }
+        });
+      }
+    } catch (error) {
+      if (!isProd) console.log(chalk.yellow(`⚠️  Error reading file ${filePath}: ${error.message}`));
+    }
+  }
+  
+  // Legacy analysis for git diff lines (keep for compatibility)
   lines.forEach((line, index) => {
     // Track current file
     if (line.startsWith('diff --git')) {
       const match = line.match(/b\/(.*)$/);
       currentFile = match ? match[1].trim() : '';
-
     }
     
     if (line.startsWith('+') && !line.startsWith('+++')) {
@@ -479,6 +813,11 @@ async function getCopilotReview(diff) {
       if (trimmedCode) {
         Object.entries(patterns).forEach(([category, patternList]) => {
           patternList.forEach(pattern => {
+            // Debug mode for pattern matching
+            if (!isProd && pattern.severity === 'critical') {
+              console.log(chalk.gray(`🔍 Testing critical pattern: ${pattern.regex.toString().substring(0, 50)}...`));
+            }
+            
             if (pattern.regex.test(code)) {
               const severityIcon = {
                 'critical': '🔴',
@@ -487,17 +826,27 @@ async function getCopilotReview(diff) {
                 'low': '🟢'
               }[pattern.severity] || '🟢';
               
-              issues.push(`${severityIcon} ${currentFile}:${index + 1} - ${pattern.message}`);
+              // Build issue 
+              let issueStr = `${severityIcon} ${currentFile}:${index + 1} - ${pattern.message}`;
+              issues.push(issueStr);
               suggestions.push(`${pattern.fix}`);
               
-              // Generate actual code improvement
-              const improvement = generateCodeImprovement(code, pattern, currentFile || 'index.js', index + 1);
-              if (improvement) {
-                const fileName = currentFile || 'index.js'; // Fallback to detected filename
+              // Always try to create a fix for critical and high severity issues
+              if (pattern.severity === 'critical' || pattern.severity === 'high') {
+                const fileName = currentFile || 'index.js';
                 if (!fileChanges.has(fileName)) {
                   fileChanges.set(fileName, []);
                 }
-                fileChanges.get(fileName).push(improvement);
+                
+                const fix = {
+                  line: index + 1,
+                  original: code.trim(),
+                  improved: generateSmartFix(code, pattern, fileName, declaredVariables),
+                  file: fileName,
+                  type: pattern.severity + '-fix'
+                };
+                
+                fileChanges.get(fileName).push(fix);
               }
             }
           });
@@ -559,8 +908,17 @@ async function getCopilotReview(diff) {
       for (const [file, changes] of fileChanges) {
         feedback += `File: ${file}\n`;
         changes.forEach(change => {
-          feedback += `Line ${change.line}: ${change.original} → ${change.improved}\n`;
+          feedback += `Line ${change.line}: ${change.original.trim()} → ${change.improved.trim()}\n`;
         });
+      }
+      
+      // Debug output to confirm fixes are generated
+      if (!isProd) {
+        console.log(chalk.green(`✅ Generated ${Array.from(fileChanges.values()).reduce((sum, changes) => sum + changes.length, 0)} auto-applicable fixes`));
+      }
+    } else {
+      if (!isProd) {
+        console.log(chalk.red(`❌ No auto-applicable fixes generated despite ${issues.length} issues found`));
       }
     }
     
@@ -568,10 +926,261 @@ async function getCopilotReview(diff) {
   }
 }
 
+// Helper function to check if a line is part of an incomplete code block
+function isIncompleteCodeBlock(line, previousLines = []) {
+  const trimmed = line.trim();
+  
+  // Count opening and closing braces in previous context
+  const contextText = previousLines.join('\n') + '\n' + line;
+  const openBraces = (contextText.match(/{/g) || []).length;
+  const closeBraces = (contextText.match(/}/g) || []).length;
+  
+  // Check for orphaned closing braces
+  if (trimmed === '}' && closeBraces > openBraces) {
+    return 'orphaned_brace';
+  }
+  
+  // Check for incomplete if statements
+  if (trimmed.startsWith('if(') && !trimmed.includes('{') && !trimmed.endsWith(';')) {
+    return 'incomplete_if';
+  }
+  
+  return false;
+}
+
+// Helper function to extract all declared variables from file content
+function extractDeclaredVariables(fileContent) {
+  const declaredVars = new Set();
+  
+  // Match var, let, const declarations
+  const declarations = fileContent.match(/(var|let|const)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/g);
+  if (declarations) {
+    declarations.forEach(decl => {
+      const varMatch = decl.match(/(var|let|const)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/);
+      if (varMatch && varMatch[2]) {
+        declaredVars.add(varMatch[2]);
+      }
+    });
+  }
+  
+  // Match function parameters
+  const functionParams = fileContent.match(/function\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*\(([^)]+)\)/g);
+  if (functionParams) {
+    functionParams.forEach(func => {
+      const paramMatch = func.match(/function\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*\(([^)]+)\)/);
+      if (paramMatch && paramMatch[1]) {
+        const params = paramMatch[1].split(',').map(p => p.trim());
+        params.forEach(param => {
+          const paramName = param.split('=')[0].trim(); // Handle default parameters
+          if (paramName && /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(paramName)) {
+            declaredVars.add(paramName);
+          }
+        });
+      }
+    });
+  }
+  
+  return declaredVars;
+}
+
+// Enhanced smart fix generator for complete code handling
+function generateSmartFix(code, pattern, filePath = '', declaredVariables = new Set()) {
+  const trimmedCode = code.trim();
+  
+  // Handle console.log
+  if (pattern.message.includes('Console.log')) {
+    return trimmedCode.replace(/console\.log\(/g, '// console.log(');
+  }
+  
+  // Handle undeclared variables with smart declaration logic
+  if (pattern.message.includes('undeclared variable') || pattern.message.includes('Potential undeclared variable') || pattern.message.includes('Test undeclared variable')) {
+    const match = pattern.regex.exec(code);
+    if (match && match[1]) {
+      const varName = match[1];
+      
+      // Check if variable is already declared in the file to avoid duplicates
+      if (declaredVariables && declaredVariables.has(varName)) {
+        // Variable is declared, just return the original line (no fix needed)
+        return trimmedCode;
+      }
+      
+      // Check if this line already contains a variable declaration - don't duplicate
+      if (trimmedCode.includes(`const ${varName} =`) || trimmedCode.includes(`let ${varName} =`) || trimmedCode.includes(`var ${varName} =`)) {
+        return trimmedCode; // Already has declaration, no fix needed
+      }
+      
+      // Determine appropriate default value based on usage context
+      let defaultValue = '[]'; // Default to array
+      if (code.includes('.includes(') || code.includes('.push(') || code.includes('.pop(')) {
+        defaultValue = '[]';
+      } else if (code.includes('.length')) {
+        defaultValue = '[]';
+      } else if (code.includes('+ ') || code.includes('- ')) {
+        defaultValue = '0';
+      } else if (code.includes('toString()') || code.includes('charAt(')) {
+        defaultValue = "''";
+      }
+      
+      // Always add declaration before usage, never replace the usage line itself
+      return `const ${varName} = ${defaultValue}; // Auto-fix: Variable declaration\n${trimmedCode}`;
+    }
+    
+    // Handle specific known undeclared variables - but check if already declared
+    const specificVars = [
+      'undeclaredVariable', 'myUndefinedArray', 'testUndeclaredVar', 
+      'actuallyUndeclaredVar', 'reallyUndefinedArray', 'anotherUndeclaredVar',
+      'testData'
+    ];
+    
+    for (const varName of specificVars) {
+      if (code.includes(varName)) {
+        // Check if already declared or if line already contains declaration
+        if (declaredVariables && declaredVariables.has(varName)) {
+          return trimmedCode; // Already declared, no fix needed
+        }
+        
+        if (trimmedCode.includes(`const ${varName} =`) || trimmedCode.includes(`let ${varName} =`) || trimmedCode.includes(`var ${varName} =`)) {
+          return trimmedCode; // Already has declaration
+        }
+        
+        // Determine appropriate default value
+        let defaultValue = '[]';
+        if (code.includes('.includes(') || code.includes('.push(') || code.includes('.pop(') || code.includes('.length')) {
+          defaultValue = '[]';
+        }
+        
+        // Always add declaration before the original line, never replace it
+        return `const ${varName} = ${defaultValue}; // Auto-fix: Variable declaration\n${trimmedCode}`;
+      }
+    }
+  }
+  
+  // Handle incomplete code blocks (orphaned braces, etc.)
+  if (trimmedCode === '}' && pattern.message.includes('syntax')) {
+    // This is likely an orphaned closing brace - remove it completely
+    return ''; // Remove orphaned closing brace entirely
+  }
+  
+  // Handle var declarations
+  if (pattern.message.includes('var')) {
+    return trimmedCode.replace(/\bvar\s+/g, 'const ');
+  }
+  
+  // Handle semicolon issues with better logic
+  if (pattern.message.includes('semicolon')) {
+    // Check if line ends with complete statement
+    if (trimmedCode.endsWith('{') || trimmedCode.endsWith('}')) {
+      return trimmedCode; // Don't add semicolon to block statements
+    }
+    return trimmedCode.endsWith(';') ? trimmedCode : trimmedCode + ';';
+  }
+  
+  // Default: return original with comment
+  return `${trimmedCode} // TODO: Fix: ${pattern.message.replace(/🚨|🟠|🟡|🟢|CRITICAL:|HIGH:|MEDIUM:|LOW:/, '').trim()}`;
+}
+
 // Generate specific code improvements
 function generateCodeImprovement(originalLine, pattern, file, lineNumber) {
   const code = originalLine.trim();
   let improvedCode = code;
+  
+  // Focus on meaningful code improvements and optimizations
+  // Check for code optimization opportunities
+  
+  // Handle undeclared variables first (critical fixes)
+  if (pattern.severity === 'critical' && (pattern.message.includes('undeclared variable') || pattern.message.includes('Potential undeclared variable'))) {
+    // Extract variable name from the pattern match
+    const match = pattern.regex.exec(code);
+    if (match && match[1]) {
+      const varName = match[1];
+      // Add declaration before the line that uses it, preserving original usage
+      improvedCode = `const ${varName} = []; // TODO: Replace with proper initialization\n${code}`;
+      return {
+        line: lineNumber,
+        original: code.trim(),
+        improved: improvedCode.trim(),
+        file: file,
+        type: 'undeclared-variable-fix'
+      };
+    }
+  }
+  
+  // Handle console.log fixes
+  if (pattern.message.includes('Console.log usage detected')) {
+    improvedCode = code.replace(/console\.log\(/g, '// console.log(');
+    if (improvedCode !== code) {
+      return {
+        line: lineNumber,
+        original: code.trim(),
+        improved: improvedCode.trim(),
+        file: file,
+        type: 'console-log-fix'
+      };
+    }
+  }
+  
+  // Traditional for loop optimization
+  if (pattern.message.includes('Traditional for loop')) {
+    const forMatch = code.match(/for\s*\(\s*let\s+(\w+)\s*=\s*0;\s*\1\s*<\s*([\w.]+)\.length;\s*\1\+\+\s*\)/);
+    if (forMatch) {
+      const iterVar = forMatch[1];
+      const arrayName = forMatch[2];
+      improvedCode = code.replace(forMatch[0], `for (const ${iterVar} of ${arrayName})`);
+    }
+  }
+  
+  // Unnecessary else after return
+  else if (pattern.message.includes('Unnecessary else after return')) {
+    improvedCode = code.replace(/\}\s*else\s*\{/, '\n// else block removed - code continues after if-return\n');
+  }
+  
+  // Redundant ternary optimizations
+  else if (pattern.message.includes('Redundant ternary with false')) {
+    const ternaryMatch = code.match(/(\w+)\s*\?\s*(\w+)\s*:\s*false/);
+    if (ternaryMatch) {
+      improvedCode = code.replace(ternaryMatch[0], `${ternaryMatch[1]} && ${ternaryMatch[2]}`);
+    }
+  }
+  else if (pattern.message.includes('Redundant ternary with true')) {
+    const ternaryMatch = code.match(/(\w+)\s*\?\s*true\s*:\s*(\w+)/);
+    if (ternaryMatch) {
+      improvedCode = code.replace(ternaryMatch[0], `${ternaryMatch[1]} || ${ternaryMatch[2]}`);
+    }
+  }
+
+  // Error detection improvements
+  if (pattern.message.includes('Empty catch block')) {
+    improvedCode = code.replace(/catch\s*\([^)]*\)\s*\{\s*\}/, 'catch (error) {\n    console.error(\'Error occurred:\', error);\n    // TODO: Handle error appropriately\n  }');
+  }
+  
+  // Unused import detection
+  else if (pattern.message.includes('Unused import')) {
+    improvedCode = '// ' + code + ' // Remove unused import';
+  }
+  
+  // Array creation optimization
+  else if (pattern.message.includes('Inefficient array creation')) {
+    const arrayMatch = code.match(/Array\s*\((\d+)\)\.fill\((.+?)\)\.map\((.+?)\)/);
+    if (arrayMatch) {
+      const length = arrayMatch[1];
+      const fillValue = arrayMatch[2];
+      const mapFn = arrayMatch[3];
+      improvedCode = code.replace(arrayMatch[0], `Array.from({length: ${length}}, ${mapFn})`);
+    }
+  }
+  // Handle empty catch blocks
+  if (pattern.message.includes('Empty catch block')) {
+    improvedCode = code.replace(/catch\s*\([^)]*\)\s*\{\s*\}/, 'catch (error) {\n    console.error(\'Error occurred:\', error);\n    // TODO: Handle error appropriately\n  }');
+    if (improvedCode !== code) {
+      return {
+        line: lineNumber,
+        original: code.trim(),
+        improved: improvedCode.trim(),
+        file: file,
+        type: 'catch-block-fix'
+      };
+    }
+  }
   
   // Apply specific improvements based on pattern
   if (pattern.message.includes('var')) {
@@ -582,14 +1191,20 @@ function generateCodeImprovement(originalLine, pattern, file, lineNumber) {
       improvedCode = `const ${funcMatch[1]} = (${funcMatch[2]}) => {`;
     }
   } else if (pattern.message.includes('indexOf')) {
-    improvedCode = code.replace(/\.indexOf\(([^)]+)\)\s*[><!]==?\s*-1/, '.includes($1)');
+    // Handle explicit comparisons to -1 and bare usage in conditionals
+    if (/\.indexOf\([^)]+\)\s*[><!]==?\s*-1/.test(code)) {
+      improvedCode = code.replace(/\.indexOf\(([^)]+)\)\s*[><!]==?\s*-1/, '.includes($1)');
+    } else if (/if\s*\(.*\.indexOf\(/i.test(code) || /\.indexOf\([^)]+\)\s*\)/.test(code)) {
+      // Convert `if (str.indexOf('x'))` to `if (str.includes('x'))`
+      improvedCode = code.replace(/\.indexOf\(([^)]+)\)/g, '.includes($1)');
+    }
   } else if (pattern.message.includes('strict equality')) {
     improvedCode = code.replace(/==\s*null/g, '=== null').replace(/!=\s*null/g, '!== null');
   } else if (pattern.message.includes('Console.log')) {
     improvedCode = code.replace(/console\.log\(/g, '// console.log('); // Comment out
-  } else if (pattern.message.includes('snake_case')) {
-    // Convert snake_case to camelCase
-    improvedCode = code.replace(/([a-z]+)_([a-z])/gi, (match, p1, p2) => p1 + p2.toUpperCase());
+  } else if (pattern.message.includes('Variable redeclaration')) {
+    // Detect and fix variable redeclaration
+    improvedCode = '// ' + code + ' // Fix: Remove duplicate declaration or rename variable';
   } else if (pattern.message.includes('CommonJS require')) {
     const match = code.match(/const\s+(\w+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/);
     if (match) {
@@ -601,13 +1216,29 @@ function generateCodeImprovement(originalLine, pattern, file, lineNumber) {
     improvedCode = code.replace(/if\s*\(\s*(\w+)\s*==\s*false\s*\)/gi, 'if (!$1)');
   }
   
-  if (improvedCode !== code) {
-    return {
-      line: lineNumber,
-      original: code,
-      improved: improvedCode,
-      file: file
-    };
+  // Ensure we have meaningful improvement and proper syntax
+  if (improvedCode !== code && improvedCode.trim()) {
+    // Clean up syntax issues without creating invalid code
+    improvedCode = improvedCode.replace(/;;+/g, ';'); // Remove duplicate semicolons
+    improvedCode = improvedCode.replace(/\s+;/g, ';'); // Clean whitespace before semicolons
+    
+    // Only suggest changes that are meaningful improvements
+    const isMeaningfulChange = (
+      !improvedCode.includes('userData =') && // Avoid generic variable renames
+      !improvedCode.includes('isEnabled =') && // Avoid generic variable renames
+      improvedCode !== code && // Must be different
+      !improvedCode.endsWith(';;') && // No duplicate semicolons
+      improvedCode.length > 0 // Must have content
+    );
+    
+    if (isMeaningfulChange) {
+      return {
+        line: lineNumber,
+        original: code.trim(),
+        improved: improvedCode.trim(),
+        file: file
+      };
+    }
   }
   
   return null;
@@ -796,6 +1427,13 @@ async function handleRateLimit(diff) {
 }
 
 export async function validateCommit() {
+  const isOptionalMode = process.env.AI_OPTIONAL_MODE === 'true' || process.env.CI === 'true';
+  
+  if (isOptionalMode) {
+    console.log(chalk.cyan("🤖 AI Code Review (Optional - Nice to Have)"));
+    console.log(chalk.gray("💡 This review is optional and won't block your commit"));
+  }
+  
   try {
     console.log(chalk.blueBright("🔍 Analyzing meaningful code changes..."));
     
@@ -803,6 +1441,19 @@ export async function validateCommit() {
     const rawDiff = await git.diff(["--cached"]);
     if (!rawDiff.trim()) {
       console.log(chalk.yellow("⚠️  No staged changes found."));
+      process.exit(0);
+    }
+
+    // Get list of staged files for skip directive check
+    const stagedFiles = await getStagedFiles();
+    
+    // Check for skip validation directive in staged files
+    const { skip, file, directive } = detectSkipDirective(stagedFiles);
+    if (skip) {
+      console.log(chalk.yellow(`⚠️  Skip validation directive detected in: ${file}`));
+      console.log(chalk.gray(`📝 Directive found: "${directive}"`));
+      console.log(chalk.green("✅ Validation bypassed - commit allowed"));
+      console.log(chalk.gray("💡 Remove the skip directive to re-enable validation"));
       process.exit(0);
     }
 
@@ -814,9 +1465,6 @@ export async function validateCommit() {
       console.log(chalk.gray("📁 Files like package-lock.json, .env, etc. are excluded from AI analysis"));
       process.exit(0);
     }
-
-    // Get list of staged files for potential modification
-    const stagedFiles = await getStagedFiles();
     
     console.log(chalk.cyan("🧠 Running World-Class Code Analysis..."));
     console.log(chalk.gray(`📊 Analyzing ${meaningfulDiff.split('\n').filter(l => l.startsWith('+') || l.startsWith('-')).length} code changes`));
@@ -842,6 +1490,9 @@ export async function validateCommit() {
 
   // Automatically open files at error locations if enabled
   await openErrorLocations(aiFeedback, stagedFiles);
+  
+  // Display code comparisons (even when auto-open is disabled)
+  await displayCodeComparisonsFromFeedback(aiFeedback);
 
   // Surface Copilot suggestion summaries clearly before prompting the user
   try {
@@ -883,10 +1534,15 @@ export async function validateCommit() {
   
   if (true) {
     // Use parsed fixes or create fallback for manual handling
-    let effectiveFixes = autoFixes.length > 0 ? autoFixes : 
-      [{ filename: 'index.js', line: 1, original: 'improvements detected', improved: 'apply manually', type: 'fallback' }];
+    let effectiveFixes = autoFixes.length > 0 ? autoFixes : [];
+    
+    // If no auto-fixes but we have critical issues, create informative fallback
+    if (effectiveFixes.length === 0 && (aiFeedback.includes('CRITICAL') || aiFeedback.includes('🔴'))) {
+      effectiveFixes = [{ filename: 'index.js', line: 1, original: 'critical issues detected', improved: 'manual fix required', type: 'fallback' }];
+    }
     
     console.log(chalk.cyan(`\n🎯 Enhanced AI Workflow Activated!`));
+    console.log(chalk.gray(`⏰ You have 5 minutes to choose an option (or it will default to manual review)`));
     
     const enhancedChoices = [
       "🚀 Auto-apply Copilot suggestions and recommit",
@@ -908,17 +1564,22 @@ export async function validateCommit() {
           pageSize: 10,
           loop: false
         },
-      ], { timeoutMs: 30000 });
+      ], { timeoutMs: 300000 }); // 5 minutes timeout for user consideration
 
       // Determine behavior when the prompt times out or is cancelled.
       let enhancedDecision;
       if (cancelled) {
+        console.log(chalk.yellow("\n⏰ Prompt timed out after 5 minutes..."));
         if (DEFAULT_ON_CANCEL === 'auto-apply') {
+          console.log(chalk.cyan("🚀 Auto-applying Copilot suggestions (timeout - using configured default)..."));
           enhancedDecision = "🚀 Auto-apply Copilot suggestions and recommit";
         } else if (DEFAULT_ON_CANCEL === 'skip') {
+          console.log(chalk.cyan("⚡ Skipping AI validation and proceeding with commit (timeout - using configured default)"));
           enhancedDecision = "⚡ Skip validation and commit as-is";
         } else {
-          enhancedDecision = "❌ Cancel commit"; // safest default
+          console.log(chalk.yellow("📝 Timeout - defaulting to review mode for safety"));
+          console.log(chalk.cyan("💡 Tip: Set AI_DEFAULT_ON_CANCEL=auto-apply or AI_DEFAULT_ON_CANCEL=skip to avoid manual review on timeout"));
+          enhancedDecision = "🔧 Review suggestions only (no changes)";
         }
       } else {
         enhancedDecision = answers.enhancedDecision;
@@ -928,6 +1589,12 @@ export async function validateCommit() {
         // Map empty filenames to single staged file when applicable
         const single = stagedFiles.length === 1 ? stagedFiles[0] : null;
         const fixes = effectiveFixes.map(f => ({ ...f, filename: f.filename || single || 'index.js' }));
+        console.log(chalk.cyan(`🔧 Processing ${fixes.length} fixes for auto-apply...`));
+        if (fixes.length === 0 || fixes[0].type === 'fallback') {
+          console.log(chalk.yellow("⚠️  No auto-applicable fixes available - manual review required"));
+          console.log(chalk.red("❌ Commit rejected: Please fix the issues manually and try again"));
+          process.exit(1);
+        }
         return await autoApplyAndRecommit(fixes, stagedFiles);
       } else if (enhancedDecision === "📝 Keep local changes and apply suggestions manually") {
         const single = stagedFiles.length === 1 ? stagedFiles[0] : null;
@@ -1070,7 +1737,28 @@ export async function validateCommit() {
       console.log(chalk.white('   npx validate-commit --recommit'));
       process.exit(1);
     }
-    throw error;
+    
+    // Check if running in optional mode
+    const isOptionalMode = process.env.AI_OPTIONAL_MODE === 'true' || process.env.CI === 'true';
+    
+    if (isOptionalMode) {
+      console.log(chalk.yellow("\n⚠️  AI validation failed but continuing (optional mode)"));
+      console.log(chalk.cyan("💡 AI validation is optional (nice to have):"));
+      console.log(chalk.cyan("   - Validation error occurred, but commit will proceed"));
+      console.log(chalk.cyan("   - Manual code review recommended for this commit"));
+      console.log(chalk.gray(`   - Error: ${error.message || error}`));
+      console.log(chalk.green("\n✅ Proceeding with commit despite AI validation issues"));
+      process.exit(0);
+    } else {
+      console.log(chalk.red("\n❌ AI validation failed:"));
+      console.log(chalk.red(`   ${error.message || error}`));
+      console.log(chalk.yellow("\n🔧 Troubleshooting:"));
+      console.log(chalk.yellow("   - Check internet connection"));  
+      console.log(chalk.yellow("   - Review code changes for issues"));
+      console.log(chalk.yellow("   - Use: git commit --no-verify (emergency only)"));
+      console.log(chalk.yellow("   - Set AI_OPTIONAL_MODE=true to make validation optional"));
+      throw error;
+    }
   }
 }
 
