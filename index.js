@@ -796,6 +796,24 @@ async function getCopilotReview(diff) {
     }
   }
   
+  // Create a map to store declared variables per file for legacy analysis
+  const fileVariables = new Map();
+  
+  // Populate file variables from the modifiedFiles analysis above
+  for (const filePath of modifiedFiles) {
+    try {
+      const fullPath = path.resolve(filePath);
+      if (fsSync.existsSync(fullPath)) {
+        const fileContent = fsSync.readFileSync(fullPath, 'utf-8');
+        const declaredVariables = extractDeclaredVariables(fileContent);
+        fileVariables.set(filePath, declaredVariables);
+      }
+    } catch (error) {
+      // If we can't read the file, create empty set
+      fileVariables.set(filePath, new Set());
+    }
+  }
+
   // Legacy analysis for git diff lines (keep for compatibility)
   lines.forEach((line, index) => {
     // Track current file
@@ -835,6 +853,9 @@ async function getCopilotReview(diff) {
                 if (!fileChanges.has(fileName)) {
                   fileChanges.set(fileName, []);
                 }
+                
+                // Get declared variables for this file, or empty set if not found
+                const declaredVariables = fileVariables.get(fileName) || new Set();
                 
                 const fix = {
                   line: index + 1,
@@ -1476,6 +1497,10 @@ export async function validateCommit() {
         aiFeedback = await getCopilotReview(meaningfulDiff);
       } catch (error) {
         console.log(chalk.yellow("⚠️  GitHub Copilot unavailable, using local analysis..."));
+        if (!isProd) {
+          console.log(chalk.red(`🔍 Error details: ${error.message}`));
+          console.log(chalk.gray(`🔍 Error stack: ${error.stack}`));
+        }
         return await localCodeAnalysis(meaningfulDiff);
       }
     } else {

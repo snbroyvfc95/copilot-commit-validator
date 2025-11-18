@@ -1,6 +1,6 @@
 {
   "name": "copilot-commit-validator",
-  "version": "3.10.0",
+  "version": "3.15.0",
   "description": "Production-ready AI commit validator with enhanced error detection including undeclared variables that cause ReferenceError. Focuses on meaningful code optimizations, critical error detection, unused code removal, and performance improvements.",
   "main": "index.js",
   "type": "module",
