@@ -679,12 +679,10 @@ async function getCopilotReview(diff) {
   // Step 2: For each modified file, read entire content for context but only flag staged lines
   for (const filePath of modifiedFiles) {
     try {
-      const fs = require('fs');
-      const path = require('path');
       const fullPath = path.resolve(filePath);
       
-      if (fs.existsSync(fullPath)) {
-        const fileContent = fs.readFileSync(fullPath, 'utf-8');
+      if (fsSync.existsSync(fullPath)) {
+        const fileContent = fsSync.readFileSync(fullPath, 'utf-8');
         const fileLines = fileContent.split('\n');
         
         // Extract all variable declarations from the ENTIRE file for context using comprehensive analysis
